@@ -1,0 +1,44 @@
+name: ios-ipa
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+
+jobs:
+  core-tests:            # fast desktop check of the portable core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DPM3_BUILD_APP=OFF -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (iOS device, unsigned)
+        run: |
+          cmake -S . -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DPM3_BUILD_TOOLS=OFF
+      - name: Build
+        run: |
+          cmake --build build-ios --config Release --target pm3viewer -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Package unsigned .ipa
+        run: |
+          APP=$(find build-ios -type d -name 'pm3viewer.app' -path '*Release-iphoneos*' | head -1)
+          test -n "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry pm3viewer-unsigned.ipa Payload)
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pm3viewer-unsigned-ipa
+          path: out/pm3viewer-unsigned.ipa
