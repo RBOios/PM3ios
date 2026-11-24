@@ -117,5 +117,7 @@ if(IOS AND PM3_BUILD_NATIVE_APP)
     XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
     XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO"
     XCODE_ATTRIBUTE_ENABLE_BITCODE "NO")
-  target_link_libraries(pm3native PRIVATE pm3core "-framework Foundation" "-framework UIKit" "-framework Metal" "-framework MetalKit" "-framework QuartzCore")
+  # CoreGraphics must be linked explicitly: CGRectInset (used by AppDelegate.mm) is an out-of-line function and UIKit no longer pulls it in
+  # (first CI link failed with: Undefined symbols "_CGRectInset" referenced from -[PM3ViewController showMessage:]).
+  target_link_libraries(pm3native PRIVATE pm3core "-framework Foundation" "-framework UIKit" "-framework CoreGraphics" "-framework Metal" "-framework MetalKit" "-framework QuartzCore")
 endif()
