@@ -1,12 +1,26 @@
-name: PM3 iOS 빌드
+name: ios-ipa
+
+# Manual only: Actions tab -> ios-ipa -> Run workflow -> pick what to run.
+# (No push / pull_request triggers, so uploading files to GitHub never starts a build by itself.)
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md']
+    inputs:
+      target:
+        description: "Which job to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - core-tests
+          - ipa
+          - ipa-native
+
+permissions:
+  contents: read
 
 jobs:
   core-tests:            # fast desktop check of the portable core
+    if: ${{ inputs.target == 'all' || inputs.target == 'core-tests' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,7 +28,8 @@ jobs:
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure
 
-  ipa:
+  ipa:                   # SDL viewer app, unsigned .ipa
+    if: ${{ inputs.target == 'all' || inputs.target == 'ipa' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,3 +57,36 @@ jobs:
         with:
           name: pm3viewer-unsigned-ipa
           path: out/pm3viewer-unsigned.ipa
+          retention-days: 14
+
+  ipa-native:            # native app: UIKit + Metal, runs PM3WIN.EXE through the x86 host (no SDL)
+    # Independent of core-tests now (no "needs:"), so it can be run alone. Pick target=all to run both.
+    if: ${{ inputs.target == 'all' || inputs.target == 'ipa-native' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (iOS device, unsigned)
+        run: |
+          cmake -S . -B build-native -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DPM3_BUILD_TOOLS=OFF -DPM3_BUILD_APP=OFF -DPM3_BUILD_NATIVE_APP=ON
+      - name: Build
+        run: |
+          cmake --build build-native --config Release --target pm3native -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Package unsigned .ipa
+        run: |
+          APP=$(find build-native -type d -name 'pm3native.app' -path '*Release-iphoneos*' | head -1)
+          test -n "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry pm3native-unsigned.ipa Payload)
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pm3native-unsigned-ipa
+          path: out/pm3native-unsigned.ipa
+          retention-days: 14
