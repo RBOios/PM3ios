@@ -104,7 +104,7 @@ static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int
             int32_t m = (int32_t)b->abuf[o * 2 + c] + v; b->abuf[o * 2 + c] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m); } }
 }
 
-static const float kVoiceGain = 0.6f, kBgmGain = 2.2f;   // voice : BGM loudness about 2 : 1 (voice RMS ~8000 -> ~4800, BGM RMS ~1350 -> ~2400)
+static const float kVoiceGain = 0.6f, kBgmGain = 1.54f;   // voice : BGM loudness about 2 : 1 (voice RMS ~8000 -> ~4800, BGM RMS ~1350 -> ~2400)
 int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
     std::lock_guard<std::mutex> lk(b->amu); size_t have = b->abuf.size() / 2, n = std::min<size_t>(have, (size_t)(frames > 0 ? frames : 0));
     if (n) { std::memcpy(dst, b->abuf.data(), n * 2 * sizeof(int16_t)); b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(n * 2)); }

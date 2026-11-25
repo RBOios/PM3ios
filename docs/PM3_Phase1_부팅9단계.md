@@ -31,4 +31,4 @@
 - 디버그: `PM3_PCMLOG=1` 이면 waveOut 오픈 포맷과 PCM 블록(크기/피크)을 stderr 로 출력, `PM3_PCMDUMP=1` 은 22.05kHz 블록을 /tmp 에 저장.
 
 ## 6. 음량 비율 (fix6b)
-- 음성/효과음 : BGM ≈ 2 : 1 (`bridge.cpp` 의 `kVoiceGain=0.6`, `kBgmGain=2.2`). 측정: 음성 구간 RMS ≈ 5000, BGM 단독 구간 ≈ 2000~3000, 최대 피크 ≈ 24000(클리핑 없음). 바꾸려면 두 상수만 조정.
+- 음성/효과음 : BGM ≈ 2 : 1 (`bridge.cpp` 의 `kVoiceGain=0.6`, `kBgmGain=1.54`(2.2 의 70%)). 측정: 음성 구간 RMS ≈ 5000, BGM 단독 구간 ≈ 2000~3000, 최대 피크 ≈ 24000(클리핑 없음). 바꾸려면 두 상수만 조정.
