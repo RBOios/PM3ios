@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -90,6 +92,8 @@ void pm3_bridge_stop_game(Pm3Bridge* b) { b->quit = true; if (b->worker.joinable
 static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits) {
     if (!d || ch < 1 || rate < 1000 || (bits != 8 && bits != 16)) return;
     uint32_t bps = (uint32_t)(bits / 8) * ch, n = bytes / bps; if (!n) return;
+    if (getenv("PM3_PCMLOG")) { int pk = 0; for (uint32_t i = 0; i + (bits / 8) <= bytes; i += bits / 8) { int v = bits == 8 ? (int)d[i] - 128 : (int16_t)(d[i] | (d[i + 1] << 8)); pk = std::max(pk, v < 0 ? -v : v); } { if (getenv("PM3_PCMDUMP") && rate == 22050) { static int k = 0; char nm[64]; snprintf(nm, sizeof nm, "/tmp/pcm22_%d.raw", k++); if (FILE* f = fopen(nm, "wb")) { fwrite(d, 1, bytes, f); fclose(f); } }
+        fprintf(stderr, "[pcm] %u bytes ch=%d rate=%d bits=%d peak=%d (%s)\n", bytes, ch, rate, bits, pk, bits == 8 ? "8-bit units" : "16-bit"); }}
     auto sample = [&](uint32_t i, int c) -> int32_t { const uint8_t* p = d + (size_t)i * bps + (size_t)c * (bits / 8); return bits == 8 ? ((int32_t)p[0] - 128) * 256 : (int16_t)(p[0] | (p[1] << 8)); };
     uint64_t out_n = (uint64_t)n * PM3_AUDIO_RATE / rate; if (out_n > (uint64_t)PM3_AUDIO_RATE * 20) out_n = (uint64_t)PM3_AUDIO_RATE * 20;
     std::lock_guard<std::mutex> lk(b->amu);
@@ -100,13 +104,15 @@ static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int
             int32_t m = (int32_t)b->abuf[o * 2 + c] + v; b->abuf[o * 2 + c] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m); } }
 }
 
+static const float kVoiceGain = 0.6f, kBgmGain = 2.2f;   // voice : BGM loudness about 2 : 1 (voice RMS ~8000 -> ~4800, BGM RMS ~1350 -> ~2400)
 int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
     std::lock_guard<std::mutex> lk(b->amu); size_t have = b->abuf.size() / 2, n = std::min<size_t>(have, (size_t)(frames > 0 ? frames : 0));
     if (n) { std::memcpy(dst, b->abuf.data(), n * 2 * sizeof(int16_t)); b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(n * 2)); }
     if ((size_t)frames > n) std::memset(dst + n * 2, 0, ((size_t)frames - n) * 2 * sizeof(int16_t));
+    for (int i = 0; i < frames * 2; i++) dst[i] = (int16_t)(dst[i] * kVoiceGain);
     if (frames > 0 && !b->paused.load()) {   // BGM (soft knee above ~80% so BGM + loud voice never hard-clips): synthesize and add on top of the PCM (SE / voice)
         std::vector<float> m((size_t)frames * 2, 0.f); b->midi.render(m.data(), frames);
-        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : (int)v); n = std::max<size_t>(n, i / 2 + 1); }
+        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f * kBgmGain, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : (int)v); n = std::max<size_t>(n, i / 2 + 1); }
     }
     return (int)n;
 }

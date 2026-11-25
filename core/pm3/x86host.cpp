@@ -56,6 +56,27 @@ static const ApiDef kApis[] = {
  {"?MIDI_GetIsPlay@@YAHPAX@Z",1,1},{"?MIDI_CallBack@@YAXPAXPAUmidihdr_tag@@@Z",2,1},
 };
 
+// IMA/DVI ADPCM (WAVE_FORMAT 0x11) blocks -> signed 16-bit PCM, interleaved (the game's voices: 22.05 kHz mono, 512-byte blocks)
+static std::vector<int16_t> ima_adpcm_decode(const uint8_t* d, size_t len, int ch, int align) {
+    static const int8_t idx_adj[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
+    static const int16_t steps[89] = {7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767};
+    std::vector<int16_t> out; if (ch < 1 || ch > 2 || align < 4 * ch) return out;
+    for (size_t b = 0; b + 4 * ch <= len; b += align) {
+        size_t bl = std::min<size_t>(align, len - b); const uint8_t* p = d + b; int pred[2] = {0, 0}, idx[2] = {0, 0};
+        for (int c = 0; c < ch; c++) { pred[c] = (int16_t)(p[4 * c] | (p[4 * c + 1] << 8)); idx[c] = std::min<int>(88, p[4 * c + 2]); }
+        size_t ns = (bl - 4 * ch) * 2 / ch + 1, base = out.size(); out.resize(base + ns * ch);
+        for (int c = 0; c < ch; c++) out[base + c] = (int16_t)pred[c];
+        size_t pos = 4 * ch; size_t k = 1;   // per channel: groups of 4 bytes (8 samples) interleaved between channels
+        while (pos + 4 * ch <= bl) {
+            for (int c = 0; c < ch; c++) for (int j = 0; j < 4; j++) { uint8_t by = p[pos + c * 4 + j];
+                for (int h = 0; h < 2; h++) { int nib = h ? by >> 4 : by & 15, st = steps[idx[c]], df = st >> 3; if (nib & 1) df += st >> 2; if (nib & 2) df += st >> 1; if (nib & 4) df += st; if (nib & 8) pred[c] -= df; else pred[c] += df;
+                    pred[c] = std::max(-32768, std::min(32767, pred[c])); idx[c] = std::max(0, std::min(88, idx[c] + idx_adj[nib]));
+                    size_t si = k + (size_t)j * 2 + h; if (si < ns) out[base + si * ch + c] = (int16_t)pred[c]; } }
+            pos += 4 * ch; k += 8; }
+    }
+    return out;
+}
+
 static std::string cstr(const X86& c, uint32_t a, size_t max = 80) { std::string s; for (size_t i = 0; i < max && a + i < c.mem.size() && c.mem[a + i]; i++) s += (char)c.mem[a + i]; return s; }
 
 namespace pm3 {
@@ -330,7 +351,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         return true; };   // last cursor position given to the guest; PeekMessage polls with an empty queue in this slice
 
     // ---- waveOut HLE: the game's sound effects / voices. PCM goes to hooks->on_pcm; buffers complete after their playing time (guest clock) ----
-    struct WaveOut { int ch = 1, rate = 22050, bits = 16; uint32_t flags = 0, cb = 0, inst = 0; };
+    struct WaveOut { int ch = 1, rate = 22050, bits = 16; uint32_t flags = 0, cb = 0, inst = 0, tag = 1, align = 0; };
     struct WavePend { uint32_t hdr, done_ms, hwo; };
     std::map<uint32_t, WaveOut> waves; std::deque<WavePend> wpend; uint32_t next_wo = 0x7001;
     auto host_now = [&](X86& c) -> uint32_t { return (hooks && hooks->now_ms) ? hooks->now_ms() : (uint32_t)(c.steps / 1000); };
@@ -460,17 +481,19 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "IsRectEmpty") { ret = ((int32_t)c.rd32(a(0)) >= (int32_t)c.rd32(a(0) + 8) || (int32_t)c.rd32(a(0) + 4) >= (int32_t)c.rd32(a(0) + 12)) ? 1 : 0; }
             else if (nm == "EqualRect") { ret = 1; for (int q = 0; q < 16; q += 4) if (c.rd32(a(0) + q) != c.rd32(a(1) + q)) ret = 0; }
             else if (nm == "waveOutOpen") { uint32_t fl = a(5); ret = 0;
-                if (!(fl & 1) && a(2)) { WaveOut w; w.ch = c.rd(a(2) + 2, 2); w.rate = (int)c.rd32(a(2) + 4); w.bits = c.rd(a(2) + 14, 2); w.flags = fl; w.cb = a(3); w.inst = a(4);
+                if (!(fl & 1) && a(2)) { WaveOut w; w.ch = c.rd(a(2) + 2, 2); w.rate = (int)c.rd32(a(2) + 4); w.bits = c.rd(a(2) + 14, 2); w.flags = fl; w.cb = a(3); w.inst = a(4); w.tag = c.rd(a(2), 2); w.align = c.rd(a(2) + 12, 2);
                     if (w.ch < 1) { w.ch = 1; }
                     if (w.bits != 8 && w.bits != 16) { w.bits = 16; }
-                    uint32_t h = next_wo++; waves[h] = w; if (a(0)) c.wr32(a(0), h); char b[96]; snprintf(b, sizeof b, "%dHz %dch %dbit cbflags=%x", w.rate, w.ch, w.bits, fl); note = b; } }
+                    uint32_t h = next_wo++; waves[h] = w; if (getenv("PM3_PCMLOG")) fprintf(stderr, "[wo] open tag=%x ch=%d rate=%d bits=%d align=%u cb=%u\n", c.rd(a(2), 2), w.ch, w.rate, w.bits, c.rd(a(2) + 12, 2), c.rd(a(2) + 16, 2)); if (a(0)) c.wr32(a(0), h); char b[96]; snprintf(b, sizeof b, "tag=%x %dHz %dch %dbit align=%u bps=%u cb=%u cbflags=%x", c.rd(a(2), 2), w.rate, w.ch, w.bits, c.rd(a(2) + 12, 2), c.rd32(a(2) + 8), c.rd(a(2) + 16, 2), fl); note = b; } }
             else if (nm == "waveOutPrepareHeader") { c.wr32(a(1) + 16, c.rd32(a(1) + 16) | 2u); ret = 0; }
             else if (nm == "waveOutUnprepareHeader") { c.wr32(a(1) + 16, c.rd32(a(1) + 16) & ~2u); ret = 0; }
             else if (nm == "waveOutWrite") { uint32_t hwo = a(0), hdr = a(1), data = c.rd32(hdr), len = c.rd32(hdr + 4); ret = 0; auto wi = waves.find(hwo);
-                if (wi != waves.end() && len && data && (uint64_t)data + len <= c.mem.size()) { WaveOut& w = wi->second; uint32_t bps = (uint32_t)w.rate * w.ch * (w.bits / 8), dur = bps ? (uint32_t)((uint64_t)len * 1000 / bps) : 0;
+                if (wi != waves.end() && len && data && (uint64_t)data + len <= c.mem.size()) { WaveOut& w = wi->second; std::vector<int16_t> dec; bool ima = w.tag == 0x11;
+                    if (ima) { dec = ima_adpcm_decode(&c.mem[data], len, w.ch, (int)w.align); }
+                    uint32_t pcm_bytes = ima ? (uint32_t)(dec.size() * 2) : len, bps = (uint32_t)w.rate * w.ch * (ima ? 2 : w.bits / 8), dur = bps ? (uint32_t)((uint64_t)pcm_bytes * 1000 / bps) : 0;
                     uint32_t now = host_now(c), start = (!wpend.empty() && (int32_t)(wpend.back().done_ms - now) > 0) ? wpend.back().done_ms : now;
                     c.wr32(hdr + 16, (c.rd32(hdr + 16) & ~1u) | 0x10u); wpend.push_back({hdr, start + dur, hwo});
-                    if (hooks && hooks->on_pcm) hooks->on_pcm(&c.mem[data], len, w.ch, w.rate, w.bits);
+                    if (hooks && hooks->on_pcm) { if (ima) hooks->on_pcm((const uint8_t*)dec.data(), pcm_bytes, w.ch, w.rate, 16); else hooks->on_pcm(&c.mem[data], len, w.ch, w.rate, w.bits); }
                     char b[80]; snprintf(b, sizeof b, "%u bytes = %u ms", len, dur); note = b; }
                 else if (wi != waves.end()) c.wr32(hdr + 16, c.rd32(hdr + 16) | 1u); }
             else if (nm == "waveOutReset") { while (!wpend.empty()) { WavePend p = wpend.front(); wpend.pop_front(); wave_done(c, p); } ret = 0; }

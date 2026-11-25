@@ -23,3 +23,12 @@
 ## 4. 추가 (fix5b)
 - 무음(진동) 모드에서도 소리: `AVAudioSession` 카테고리를 `Ambient` → `Playback`(+`MixWithOthers`)로 변경. 이제 무음 스위치와 상관없이 미디어 볼륨으로 재생된다.
 - 워크플로: `ipa`(SDL 뷰어) 잡 없음 — `core-tests`, `ipa-native` 만 남음(`target` 선택: all / core-tests / ipa-native).
+
+## 5. 추가 (fix6): 음성 재생 시 찢어지는 소리
+- 원인: 게임은 음성(TAK)을 **IMA ADPCM(포맷 0x11, 22.05kHz 모노, 블록 512B)** 으로 `waveOut` 에 쓰는데, HLE 가 포맷 태그를 무시하고 압축 바이트를 16bit PCM 으로 재생 → 풀스케일 잡음(실기 녹화에서 0.4초 구간 RMS 14000, 클리핑 137샘플, 영교차 ≈4.8kHz 로 확인).
+- 수정: `waveOutOpen` 에서 태그/블록 크기 저장, `waveOutWrite` 에서 IMA ADPCM 을 PCM16 으로 디코드해서 `on_pcm` 으로 전달. 재생 시간(WOM_DONE 타이밍)도 디코드된 길이로 계산(이전엔 4배 짧게 계산됨 → 음성 버퍼가 너무 빨리 반환).
+- 확인: 같은 입력 흐름에서 해당 구간이 영교차 400~1800Hz 의 음성 형태로 바뀜(잡음 사라짐). 디코더는 `wav.cpp` 의 IMA 와 같은 레이아웃(4바이트 헤더 + 4바이트 그룹).
+- 디버그: `PM3_PCMLOG=1` 이면 waveOut 오픈 포맷과 PCM 블록(크기/피크)을 stderr 로 출력, `PM3_PCMDUMP=1` 은 22.05kHz 블록을 /tmp 에 저장.
+
+## 6. 음량 비율 (fix6b)
+- 음성/효과음 : BGM ≈ 2 : 1 (`bridge.cpp` 의 `kVoiceGain=0.6`, `kBgmGain=2.2`). 측정: 음성 구간 RMS ≈ 5000, BGM 단독 구간 ≈ 2000~3000, 최대 피크 ≈ 24000(클리핑 없음). 바꾸려면 두 상수만 조정.
