@@ -9,7 +9,7 @@
    - 측정(100M 스텝, 첫 프레임 이후 `on_frame` 간 최대 간격): fix2 **6,930,345 스텝**(약 0.1초+) → **346,609 스텝**.
 3. **waveOut HLE**: `waveOutOpen/PrepareHeader/Write/UnprepareHeader/Reset/Close`. 형식 읽기(게임은 8000Hz·1ch·16bit, `CALLBACK_WINDOW`), `WAVEHDR.dwFlags`(PREPARED/INQUEUE/DONE) 갱신, 재생 시간(바이트/바이트율)이 지나면 DONE + `MM_WOM_DONE`(0x3BD) 메시지(창 콜백) 또는 함수 콜백 호출. PCM 은 `X86Hooks::on_pcm` 으로 전달.
 4. **브리지 오디오 큐**: `pm3_bridge_pull_audio(b, int16 stereo*, frames)`, 출력 44.1kHz. 8/16bit·모노/스테레오·임의 샘플레이트 → 선형 보간 변환, 동시에 시작한 소리는 **더해서 믹스**.
-5. **iOS 출력**: `ios_native/PM3Audio.{h,mm}` — `AVAudioEngine` + `AVAudioSourceNode` 가 위 함수를 당겨 감. `AppDelegate.mm` 에서 게임 시작 직후 `start`, 해제 시 `stop`. 무음 스위치 존중(Ambient), 전화 등 인터럽션 후 재시작. CMake: AVFoundation/AudioToolbox 추가.
+5. **iOS 출력**: `ios_native/PM3Audio.{h,mm}` — `AVAudioEngine` + `AVAudioSourceNode` 가 위 함수를 당겨 감. `AppDelegate.mm` 에서 게임 시작 직후 `start`, 해제 시 `stop`. 무음 스위치 무시(Playback+MixWithOthers), 전화 등 인터럽션 후 재시작. CMake: AVFoundation/AudioToolbox 추가.
 6. 헤드리스: `PM3_WAV=<파일>` 이면 셸이 재생했을 오디오를 WAV 로 저장하고 큰 소리 샘플 수를 출력.
 
 ## 2. 검증 (이 환경: 리눅스 g++)

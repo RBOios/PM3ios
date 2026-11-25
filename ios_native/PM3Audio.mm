@@ -19,7 +19,7 @@
     if (_engine) return;
     NSError *err = nil;
     AVAudioSession *session = AVAudioSession.sharedInstance;
-    [session setCategory:AVAudioSessionCategoryAmbient error:&err];   // respects the silent switch, mixes with other apps
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&err];   // Playback: plays even with the silent switch on (like a media player); mixes with other apps' audio
     [session setActive:YES error:&err];
 
     AVAudioFormat *fmt = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:PM3_AUDIO_RATE channels:2 interleaved:NO];

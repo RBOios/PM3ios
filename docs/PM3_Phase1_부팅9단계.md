@@ -19,3 +19,7 @@
 - BGM 이 장면마다 바뀌는지, 전환 시 끊김은 실기 확인 필요. 게임 폴더에 `MIDI/` 폴더(원본)가 있어야 소리가 남.
 - iOS 코드는 여전히 로컬 컴파일 불가 → CI 첫 빌드가 확인.
 - 타이틀 글씨 모양: fix4 의 Blt 수정으로 바뀌었는지 실기 확인 필요(내가 직접 비교할 기준 사진 없음).
+
+## 4. 추가 (fix5b)
+- 무음(진동) 모드에서도 소리: `AVAudioSession` 카테고리를 `Ambient` → `Playback`(+`MixWithOthers`)로 변경. 이제 무음 스위치와 상관없이 미디어 볼륨으로 재생된다.
+- 워크플로: `ipa`(SDL 뷰어) 잡 없음 — `core-tests`, `ipa-native` 만 남음(`target` 선택: all / core-tests / ipa-native).
