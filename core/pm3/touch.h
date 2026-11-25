@@ -3,6 +3,7 @@
 //   touch_move  : Move events while dragging                                -- hover/highlight follow the finger
 //   touch_end   : Move to the last position, then ButtonDown + ButtonUp      -- the click happens on release
 //   touch_cancel: no click.
+//   right_click : two-finger tap / long press on iOS = mouse right button (PC: right click = back / cancel).
 // Only the first finger is tracked; a touch that starts in the letterbox bars is ignored. Coordinates are in view units
 // (iOS points or pixels, whatever the viewport was built with) and are mapped to 640x480 logical pixels.
 #pragma once
@@ -21,6 +22,7 @@ public:
     void touch_move(int id, float vx, float vy);
     void touch_end(int id, float vx, float vy);
     void touch_cancel(int id);
+    void right_click(float vx, float vy);      // right button (the PC game's "back / cancel"): Move, then ButtonDown + ButtonUp with button = 1; drops a finger that is still tracked
     bool poll(MouseEvent* ev);                 // pops the next event
     bool tracking() const { return active_; }
 

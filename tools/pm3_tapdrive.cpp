@@ -11,8 +11,8 @@ int main(int argc,char**argv){
   Pm3Bridge*b=pm3_bridge_create(); pm3_bridge_set_paths(b,argv[1],argv[2]); pm3_bridge_set_view_size(b,640,480,0);
   if(!pm3_bridge_start_game(b)){puts("nostart");return 1;}
   std::vector<uint32_t> fr(640*480); std::this_thread::sleep_for(std::chrono::seconds(6)); pm3_bridge_copy_frame(b,fr.data()); save("/tmp/drv_0.ppm",fr);
-  int n=1; char* s=strdup(argv[3]); for(char*t=strtok(s,";");t;t=strtok(0,";")){ int x,y; double w; sscanf(t,"%d,%d,%lf",&x,&y,&w);
-    pm3_bridge_touch_begin(b,1,(float)x,(float)y); std::this_thread::sleep_for(std::chrono::milliseconds(120)); pm3_bridge_touch_end(b,1,(float)x,(float)y);
+  int n=1; char* s=strdup(argv[3]); for(char*t=strtok(s,";");t;t=strtok(0,";")){ int x,y,r=0; double w; sscanf(t,"%d,%d,%lf,%d",&x,&y,&w,&r);   // 4th field 1 = right click
+    if(r){ pm3_bridge_right_click(b,(float)x,(float)y); } else { pm3_bridge_touch_begin(b,1,(float)x,(float)y); std::this_thread::sleep_for(std::chrono::milliseconds(120)); pm3_bridge_touch_end(b,1,(float)x,(float)y); }
     std::this_thread::sleep_for(std::chrono::milliseconds((int)(w*1000))); pm3_bridge_copy_frame(b,fr.data()); char p[64]; sprintf(p,"/tmp/drv_%d.ppm",n++); save(p,fr);
     printf("tap %d,%d -> running=%d\n",x,y,pm3_bridge_game_running(b)); fflush(stdout);}
   pm3_bridge_stop_game(b); return 0;}

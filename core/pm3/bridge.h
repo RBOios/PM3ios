@@ -33,6 +33,7 @@ void pm3_bridge_touch_begin(Pm3Bridge*, int id, float x, float y);
 void pm3_bridge_touch_move(Pm3Bridge*, int id, float x, float y);
 void pm3_bridge_touch_end(Pm3Bridge*, int id, float x, float y);
 void pm3_bridge_touch_cancel(Pm3Bridge*, int id);
+void pm3_bridge_right_click(Pm3Bridge*, float x, float y);   // right mouse button at a view point (iOS: two-finger tap / long press) = the PC game's back / cancel
 int pm3_bridge_poll_mouse(Pm3Bridge*, Pm3MouseEvent* out);   // 1 if an event was returned
 
 // Runs the original PM3WIN.EXE (x86 interpreter + Win32 HLE, core/pm3/x86host.cpp) on a worker thread. Call after pm3_bridge_set_paths().

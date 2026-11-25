@@ -42,6 +42,7 @@ void pm3_bridge_touch_begin(Pm3Bridge* b, int id, float x, float y) { std::lock_
 void pm3_bridge_touch_move(Pm3Bridge* b, int id, float x, float y) { std::lock_guard<std::mutex> lk(b->mu); b->touch.touch_move(id, x, y); }
 void pm3_bridge_touch_end(Pm3Bridge* b, int id, float x, float y) { std::lock_guard<std::mutex> lk(b->mu); b->touch.touch_end(id, x, y); }
 void pm3_bridge_touch_cancel(Pm3Bridge* b, int id) { std::lock_guard<std::mutex> lk(b->mu); b->touch.touch_cancel(id); }
+void pm3_bridge_right_click(Pm3Bridge* b, float x, float y) { std::lock_guard<std::mutex> lk(b->mu); b->touch.right_click(x, y); }
 int pm3_bridge_poll_mouse(Pm3Bridge* b, Pm3MouseEvent* out) { std::lock_guard<std::mutex> lk(b->mu); pm3::MouseEvent e; if (!b->touch.poll(&e)) return 0; out->type = (int)e.type; out->x = e.x; out->y = e.y; out->button = e.button; return 1; }
 
 void* pm3_bridge_fopen(Pm3Bridge* b, const char* path, const char* mode) { return b->vfs.open(path, mode); }
@@ -62,7 +63,7 @@ int pm3_bridge_start_game(Pm3Bridge* b) {
         auto t0 = std::chrono::steady_clock::now();
         h.now_ms = [t0, b] { return (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() - b->paused_ms.load()); };   // guest clock skips paused time
         h.on_pcm = [b](const uint8_t* d, uint32_t n, int ch, int rate, int bits) { push_pcm(b, d, n, ch, rate, bits); };
-        h.poll_mouse = [b](int* t, int* x, int* y) { std::lock_guard<std::mutex> lk(b->mu); pm3::MouseEvent e; if (!b->touch.poll(&e)) return false; *t = (int)e.type; *x = e.x; *y = e.y; return true; };
+        h.poll_mouse = [b](int* t, int* x, int* y) { std::lock_guard<std::mutex> lk(b->mu); pm3::MouseEvent e; if (!b->touch.poll(&e)) return false; *t = (e.button == 1 && e.type != pm3::MouseEvent::Move) ? (e.type == pm3::MouseEvent::ButtonDown ? 3 : 4) : (int)e.type; *x = e.x; *y = e.y; return true; };
         h.on_frame = [b](const pm3::X86Frame& f) {
             if (b->quit.load()) return false;
             if (b->paused.load()) { auto p0 = std::chrono::steady_clock::now();   // frozen: keep the last frame, wait

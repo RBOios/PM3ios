@@ -12,9 +12,10 @@ static NSString *const kShader = @
     "fragment float4 pm3_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  return tex.sample(s, in.uv); }\n";
 
-@interface PM3MetalView () <MTKViewDelegate> {
+@interface PM3MetalView () <MTKViewDelegate, UIGestureRecognizerDelegate> {
     id<MTLCommandQueue> _queue; id<MTLRenderPipelineState> _pso; id<MTLTexture> _tex;
     id<MTLSamplerState> _nearest, _linear;
+    UITouch *_tracked; BOOL _multi;   // the finger that drives the left button; _multi = a second finger joined (two-finger tap = right click, no left click)
 }
 @end
 
@@ -29,7 +30,13 @@ static NSString *const kShader = @
         self.clearColor = MTLClearColorMake(0, 0, 0, 1);              // letterbox bars
         self.preferredFramesPerSecond = 30;                            // the original ran at ~30 fps
         self.framebufferOnly = YES;
-        self.multipleTouchEnabled = NO;
+        self.multipleTouchEnabled = YES;                               // needed to notice the 2nd finger of a two-finger tap (only the first finger drives the cursor)
+        // Right mouse button (the PC game's "back / cancel": leaves CONFIG, closes menus ...):
+        //   two-finger tap  or  long press (~0.5 s, finger kept still)
+        UITapGestureRecognizer *two = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTwoFingerTap:)];
+        two.numberOfTouchesRequired = 2; two.cancelsTouchesInView = NO; two.delegate = self; [self addGestureRecognizer:two];
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
+        lp.minimumPressDuration = 0.5; lp.allowableMovement = 12; lp.numberOfTouchesRequired = 1; lp.cancelsTouchesInView = YES; lp.delegate = self; [self addGestureRecognizer:lp];
         _queue = [dev newCommandQueue];
         // frame buffer texture: 640x480 BGRA8 == the core's 0xAARRGGBB uint32 layout
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -79,9 +86,37 @@ static NSString *const kShader = @
 }
 
 // Touch -> mouse (hover while moving, click on release) is implemented in the core (pm3/touch.cpp); the view only forwards points.
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { CGPoint p = [[touches anyObject] locationInView:self]; pm3_bridge_touch_begin(_bridge, 1, (float)p.x, (float)p.y); }
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { CGPoint p = [[touches anyObject] locationInView:self]; pm3_bridge_touch_move(_bridge, 1, (float)p.x, (float)p.y); }
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { CGPoint p = [[touches anyObject] locationInView:self]; pm3_bridge_touch_end(_bridge, 1, (float)p.x, (float)p.y); }
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { pm3_bridge_touch_cancel(_bridge, 1); }
+// Right button: two-finger tap or long press -> pm3_bridge_right_click (WM_RBUTTONDOWN/UP for the game).
+- (void)onTwoFingerTap:(UITapGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateRecognized) return;
+    CGPoint p = [g locationInView:self]; pm3_bridge_touch_cancel(_bridge, 1); pm3_bridge_right_click(_bridge, (float)p.x, (float)p.y);
+}
+- (void)onLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [g locationInView:self]; pm3_bridge_touch_cancel(_bridge, 1); pm3_bridge_right_click(_bridge, (float)p.x, (float)p.y);
+    if (@available(iOS 10.0, *)) { UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight]; [h impactOccurred]; }
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b { return NO; }
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (e.allTouches.count > 1) { _multi = YES; if (_tracked) { pm3_bridge_touch_cancel(_bridge, 1); } return; }   // second finger: this is a two-finger gesture, not a click
+    _multi = NO; _tracked = [touches anyObject]; CGPoint p = [_tracked locationInView:self]; pm3_bridge_touch_begin(_bridge, 1, (float)p.x, (float)p.y);
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (_multi || !_tracked || ![touches containsObject:_tracked]) return;
+    CGPoint p = [_tracked locationInView:self]; pm3_bridge_touch_move(_bridge, 1, (float)p.x, (float)p.y);
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (_tracked && [touches containsObject:_tracked]) {
+        if (_multi) pm3_bridge_touch_cancel(_bridge, 1);
+        else { CGPoint p = [_tracked locationInView:self]; pm3_bridge_touch_end(_bridge, 1, (float)p.x, (float)p.y); }
+        _tracked = nil;
+    }
+    if (e.allTouches.count <= touches.count) _multi = NO;   // all fingers are up
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (_tracked && [touches containsObject:_tracked]) { pm3_bridge_touch_cancel(_bridge, 1); _tracked = nil; }
+    if (e.allTouches.count <= touches.count) _multi = NO;
+}
 
 @end

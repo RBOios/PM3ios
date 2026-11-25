@@ -25,6 +25,14 @@ void TouchMouse::touch_end(int id, float vx, float vy) {
 
 void TouchMouse::touch_cancel(int id) { if (active_ && id == id_) active_ = false; }
 
+void TouchMouse::right_click(float vx, float vy) {
+    active_ = false;                                       // a left touch that was still down becomes this gesture: no left click on release
+    int gx, gy; if (!view_to_game(vp_, vx, vy, &gx, &gy)) return;
+    lx_ = gx; ly_ = gy; push(MouseEvent::Move, gx, gy);
+    MouseEvent d; d.type = MouseEvent::ButtonDown; d.x = gx; d.y = gy; d.button = 1; q_.push_back(d);
+    MouseEvent u; u.type = MouseEvent::ButtonUp; u.x = gx; u.y = gy; u.button = 1; q_.push_back(u);
+}
+
 bool TouchMouse::poll(MouseEvent* ev) { if (q_.empty()) return false; *ev = q_.front(); q_.pop_front(); return true; }
 
 }  // namespace pm3

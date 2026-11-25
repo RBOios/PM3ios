@@ -158,6 +158,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                     static std::map<uint32_t, int> srefs;   // COM refcount; the pixel memory of a fully released surface goes back to the heap
                     if (i == 1) { int& r = srefs.emplace(self, 1).first->second; ret = (uint32_t)++r; }
                     else if (i == 2) { int& r = srefs.emplace(self, 1).first->second; if (r > 0) r--; ret = (uint32_t)r; if (r == 0 && sf.mem && !sf.primary) { release(sf.mem); sf.mem = 0; sf.w = sf.h = 0; } }
+                    else if (i == 25 && getenv("LOCKLOG") && (hostlog("  [lock] surf=%x %dx%d mem=%x ret@%x\n", self, sf.w, sf.h, sf.mem, c.rd32(c.r[4])), false)) {}
                     else if (i == 25) { uint32_t d = c.arg(2); for (uint32_t q = 4; q < 108; q += 4) c.wr32(d + q, 0); c.wr32(d, 108); c.wr32(d + 4, 0x100f | 0x800 | 1);
                         c.wr32(d + 8, sf.h); c.wr32(d + 12, sf.w); c.wr32(d + 16, sf.pitch); c.wr32(d + 36, sf.mem); fill_pf(c, d + 72, sf.bpp); }
                     else if (i == 22) { uint32_t d = c.arg(1); c.wr32(d + 4, 0x100f); c.wr32(d + 8, sf.h); c.wr32(d + 12, sf.w); c.wr32(d + 16, sf.pitch); fill_pf(c, d + 72, sf.bpp); }
@@ -177,16 +178,41 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                             dr ? (int)c.rd32(dr) : -1, dr ? (int)c.rd32(dr + 4) : -1, dr ? (int)c.rd32(dr + 8) : -1, dr ? (int)c.rd32(dr + 12) : -1, c.arg(2), surfs.count(c.arg(2)) ? "" : "(none)",
                             sr ? (int)c.rd32(sr) : -1, sr ? (int)c.rd32(sr + 4) : -1, sr ? (int)c.rd32(sr + 8) : -1, sr ? (int)c.rd32(sr + 12) : -1, c.arg(4), c.arg(5) ? c.rd32(c.arg(5) + 80) : 0, c.rd32(c.r[4])); }
                         uint32_t src = i == 5 ? c.arg(2) : c.arg(3); uint32_t srect = i == 5 ? c.arg(3) : c.arg(4);
-                        int dx = 0, dy = 0, w = sf.w, h = sf.h; int sx = 0, sy = 0;
-                        if (i == 5 && c.arg(1)) { dx = (int)c.rd32(c.arg(1)); dy = (int)c.rd32(c.arg(1) + 4); w = (int)c.rd32(c.arg(1) + 8) - dx; h = (int)c.rd32(c.arg(1) + 12) - dy; }
-                        if (i == 7) { dx = (int)c.arg(1); dy = (int)c.arg(2); }
-                        if (surfs.count(src)) { Surf& ss = surfs[src]; if (!srect) { w = std::min(w, ss.w); h = std::min(h, ss.h); }
-                            else { sx = (int)c.rd32(srect); sy = (int)c.rd32(srect + 4); w = (int)c.rd32(srect + 8) - sx; h = (int)c.rd32(srect + 12) - sy; }
-                            int bp = sf.bpp / 8; bool key = ss.has_key && ((i == 5 && (c.arg(4) & 0x8000)) || (i == 7 && (c.arg(5) & 1)));   // DDBLT_KEYSRC / DDBLTFAST_SRCCOLORKEY
-                            for (int y = 0; y < h; y++) { if (dy + y < 0 || dy + y >= sf.h || sy + y < 0 || sy + y >= ss.h) continue;
-                                int ww = std::min(w, std::min(sf.w - dx, ss.w - sx)); if (ww <= 0) continue;
-                                if (!key) std::memmove(&c.mem[sf.mem + (dy + y) * sf.pitch + dx * bp], &c.mem[ss.mem + (sy + y) * ss.pitch + sx * bp], ww * bp);
-                                else for (int x = 0; x < ww; x++) { uint32_t v = c.rd(ss.mem + (sy + y) * ss.pitch + (sx + x) * bp, bp == 2 ? 2 : 4); if (v >= ss.ck_lo && v <= ss.ck_hi) continue; c.wr(sf.mem + (dy + y) * sf.pitch + (dx + x) * bp, bp == 2 ? 2 : 4, v); } } }
+                        uint32_t flags = i == 5 ? c.arg(4) : c.arg(5), fx = i == 5 ? c.arg(5) : 0;
+                        if (surfs.count(src) && sf.mem) { Surf& ss = surfs[src]; if (ss.mem) {
+                            // destination rect (Blt: lpDestRect, NULL = whole surface; BltFast: top-left point + source size)
+                            int dl = 0, dt = 0, dr_ = sf.w, db = sf.h, sl = 0, st = 0, sr_ = ss.w, sb = ss.h;
+                            if (srect) { sl = (int)c.rd32(srect); st = (int)c.rd32(srect + 4); sr_ = (int)c.rd32(srect + 8); sb = (int)c.rd32(srect + 12); }
+                            if (i == 5) { if (c.arg(1)) { dl = (int)c.rd32(c.arg(1)); dt = (int)c.rd32(c.arg(1) + 4); dr_ = (int)c.rd32(c.arg(1) + 8); db = (int)c.rd32(c.arg(1) + 12); }
+                                          else if (!srect) { /* both NULL: whole surfaces, stretched to fit */ } }
+                            else { dl = (int)c.arg(1); dt = (int)c.arg(2); dr_ = dl + (sr_ - sl); db = dt + (sb - st); }
+                            int dw = dr_ - dl, dh = db - dt, sw = sr_ - sl, sh = sb - st;
+                            if (dw > 0 && dh > 0 && sw > 0 && sh > 0) {
+                                int bp = sf.bpp / 8, sbp = ss.bpp / 8; uint32_t szr = bp == 2 ? 2 : 4;
+                                // colour keys: surface key (DDBLT_KEYSRC / DDBLTFAST_SRCCOLORKEY) or the one in the DDBLTFX (DDBLT_KEYSRCOVERRIDE, fx+92)
+                                bool skey = false, dkey = false; uint32_t sk_lo = 0, sk_hi = 0, dk_lo = 0, dk_hi = 0;
+                                if (i == 5) {
+                                    if ((flags & 0x10000) && fx) { skey = true; sk_lo = c.rd32(fx + 92); sk_hi = c.rd32(fx + 96); }
+                                    else if ((flags & 0x8000) && ss.has_key) { skey = true; sk_lo = ss.ck_lo; sk_hi = ss.ck_hi; }
+                                    if ((flags & 0x4000) && fx) { dkey = true; dk_lo = c.rd32(fx + 84); dk_hi = c.rd32(fx + 88); }
+                                    else if ((flags & 0x2000) && sf.has_key) { dkey = true; dk_lo = sf.ck_lo; dk_hi = sf.ck_hi; }
+                                } else if ((flags & 1) && ss.has_key) { skey = true; sk_lo = ss.ck_lo; sk_hi = ss.ck_hi; }
+                                else if ((flags & 2) && sf.has_key) { dkey = true; dk_lo = sf.ck_lo; dk_hi = sf.ck_hi; }
+                                bool mirx = i == 5 && (flags & 0x800) && (fx ? (c.rd32(fx + 4) & 0x2) : 0), miry = i == 5 && (flags & 0x800) && (fx ? (c.rd32(fx + 4) & 0x4) : 0);   // DDBLT_DDFX + DDBLTFX_MIRRORLEFTRIGHT / UPDOWN
+                                const bool same = (dw == sw && dh == sh && !mirx && !miry);
+                                for (int y = 0; y < dh; y++) { int ty = dt + y; if (ty < 0 || ty >= sf.h) continue;
+                                    int syy = same ? st + y : st + (int)((int64_t)(miry ? dh - 1 - y : y) * sh / dh); if (syy < 0 || syy >= ss.h) continue;
+                                    if (same && !skey && !dkey && sbp == bp) {   // fast path: clipped row copy
+                                        int x0 = std::max(0, std::max(-dl, -sl)), x1 = std::min(dw, std::min(sf.w - dl, ss.w - sl)); if (x1 > x0)
+                                            std::memmove(&c.mem[sf.mem + ty * sf.pitch + (dl + x0) * bp], &c.mem[ss.mem + syy * ss.pitch + (sl + x0) * bp], (size_t)(x1 - x0) * bp);
+                                        continue; }
+                                    for (int x = 0; x < dw; x++) { int tx = dl + x; if (tx < 0 || tx >= sf.w) continue;
+                                        int sxx = same ? sl + x : sl + (int)((int64_t)(mirx ? dw - 1 - x : x) * sw / dw); if (sxx < 0 || sxx >= ss.w) continue;
+                                        uint32_t v = c.rd(ss.mem + syy * ss.pitch + sxx * sbp, sbp == 2 ? 2 : 4);
+                                        if (skey && v >= sk_lo && v <= sk_hi) continue;
+                                        if (dkey) { uint32_t o = c.rd(sf.mem + ty * sf.pitch + tx * bp, szr); if (!(o >= dk_lo && o <= dk_hi)) continue; }
+                                        c.wr(sf.mem + ty * sf.pitch + tx * bp, szr, v); } }
+                            } } }
                     }
                 }
                 if (calls < 4000) hostlog("  [com] %s -> %x\n", nm.c_str(), ret);
@@ -388,12 +414,15 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 Surf* sf = sdc(a(0)); ret = 0;
                 if (sf) { int xD = (int)a(1), yD = (int)a(2), w = (int)a(3), h = (int)a(4), xS = (int)a(5), yS = (int)a(6), st = (int)a(7), cl = (int)a(8); uint32_t bits = a(9), bmi = a(10);
                     uint32_t hs = c.rd32(bmi); int bw = (int32_t)c.rd32(bmi + 4), bh = (int32_t)c.rd32(bmi + 8), bc = c.rd(bmi + 14, 2); uint32_t used = c.rd32(bmi + 32);
+                    if (getenv("DIBLOG")) hostlog("  [dib] surf=%x dst=(%d,%d) %dx%d src=(%d,%d) startScan=%d lines=%d bmp=%dx%d bpp=%d comp=%u used=%u hs=%u\n", (unsigned)sf->obj, xD, yD, w, h, xS, yS, st, cl, bw, bh, bc, c.rd32(bmi + 16), used, hs);
                     bool topdown = bh < 0; uint32_t stride = ((uint32_t)bw * bc + 31) / 32 * 4; uint32_t pal = bmi + hs; if (bc <= 8 && used == 0) used = 1u << bc;
                     int bp = sf->bpp / 8;
                     for (int r = 0; r < h; r++) { int sr = topdown ? (yS + r) : (yS + (h - 1 - r)); int line = sr - st; if (line < 0 || line >= cl) continue; int dy = yD + r; if (dy < 0 || dy >= sf->h) continue;
                         uint32_t row = bits + (uint32_t)line * stride;
                         for (int q = 0; q < w; q++) { int sx = xS + q, dx = xD + q; if (dx < 0 || dx >= sf->w || sx < 0 || sx >= bw) continue; uint32_t rr, gg, bb;
-                            if (bc == 8) { uint32_t i = c.rd8(row + sx); if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }
+                            if (bc == 4) { uint32_t i = c.rd8(row + (sx >> 1)); i = (sx & 1) ? (i & 15) : (i >> 4); if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }   // 4 bpp: high nibble = left pixel (the title-menu button plates)
+                            else if (bc == 1) { uint32_t i = (c.rd8(row + (sx >> 3)) >> (7 - (sx & 7))) & 1; if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }
+                            else if (bc == 8) { uint32_t i = c.rd8(row + sx); if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }
                             else if (bc == 24) { bb = c.rd8(row + 3 * sx); gg = c.rd8(row + 3 * sx + 1); rr = c.rd8(row + 3 * sx + 2); }
                             else if (bc == 32) { bb = c.rd8(row + 4 * sx); gg = c.rd8(row + 4 * sx + 1); rr = c.rd8(row + 4 * sx + 2); }
                             else if (bc == 16) { uint32_t v = c.rd(row + 2 * sx, 2); rr = ((v >> 10) & 31) << 3; gg = ((v >> 5) & 31) << 3; bb = (v & 31) << 3; }
@@ -447,7 +476,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                     uint32_t now = hooks->now_ms ? hooks->now_ms() : (uint32_t)(c.steps / 1000);
                     while (!mpend.empty()) { MEv e = mpend.front(); if (e.t != 0 && now - mlast < 50) break; mpend.pop_front(); mouse_x = e.x; mouse_y = e.y; mlast = now;
                         uint32_t pos = (uint32_t)(e.x & 0xFFFF) | ((uint32_t)(e.y & 0xFFFF) << 16);
-                        if (e.t == 0) mq.push_back({0x1234, 0x0200, 0, pos}); else if (e.t == 1) mq.push_back({0x1234, 0x0201, 1, pos}); else if (e.t == 2) mq.push_back({0x1234, 0x0202, 0, pos}); }
+                        if (e.t == 0) mq.push_back({0x1234, 0x0200, 0, pos}); else if (e.t == 1) mq.push_back({0x1234, 0x0201, 1, pos}); else if (e.t == 2) mq.push_back({0x1234, 0x0202, 0, pos}); else if (e.t == 3) mq.push_back({0x1234, 0x0204, 2, pos}); else if (e.t == 4) mq.push_back({0x1234, 0x0205, 0, pos}); }   // WM_RBUTTONDOWN (MK_RBUTTON) / WM_RBUTTONUP
                 }
                 if (mq.empty()) idle_polls++;
                 if (getenv("INJECT") && mq.empty() && seen[nm] % 300000 == 0) {   // INJECT=1 : periodic mouse move/click + Enter key, to see whether the game waits for input
@@ -552,7 +581,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             for (int y = 0; y < sf.h; y++) for (int x = 0; x < sf.w; x++) { uint8_t rgb[3]; uint32_t v = cpu.rd(sf.mem + y * sf.pitch + x * (sf.bpp / 8), sf.bpp == 16 ? 2 : 4); if (v) any = true;
                 if (sf.bpp == 16) { rgb[0] = ((v >> 11) & 31) * 255 / 31; rgb[1] = ((v >> 5) & 63) * 255 / 63; rgb[2] = (v & 31) * 255 / 31; } else { rgb[0] = (v >> 16) & 255; rgb[1] = (v >> 8) & 255; rgb[2] = v & 255; }
                 fwrite(rgb, 1, 3, f); }
-            fclose(f); hostlog("surface %d: %dx%d %dbpp %s%s -> %s\n", n - 1, sf.w, sf.h, sf.bpp, sf.primary ? "PRIMARY " : "", any ? "has pixels" : "all zero", fn.c_str()); }
+            fclose(f); hostlog("surface %d @%x: %dx%d %dbpp %s%s -> %s\n", n - 1, (unsigned)sf.obj, sf.w, sf.h, sf.bpp, sf.primary ? "PRIMARY " : "", any ? "has pixels" : "all zero", fn.c_str()); }
     }
     if (const char* po = getenv("DUMP_PRIMARY")) {   // DUMP_PRIMARY=<file.ppm> : write the primary surface (RGB565/XRGB8888) at exit
         for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; FILE* f = fopen(po, "wb"); if (!f) break;
