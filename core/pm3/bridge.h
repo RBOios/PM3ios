@@ -42,6 +42,10 @@ int pm3_bridge_poll_mouse(Pm3Bridge*, Pm3MouseEvent* out);   // 1 if an event wa
 int pm3_bridge_start_game(Pm3Bridge*);        // 1 on start, 0 if already running or PM3WIN.EXE is missing
 void pm3_bridge_stop_game(Pm3Bridge*);        // blocks until the worker has stopped
 int pm3_bridge_game_running(const Pm3Bridge*);
+// Audio: the guest's waveOut PCM is converted to 16-bit stereo at PM3_AUDIO_RATE and mixed into a small queue; the shell's audio callback pulls from it.
+// Sounds that start while another is still queued are added on top of it (mixed). Silence is written when nothing is queued.
+#define PM3_AUDIO_RATE 44100
+int pm3_bridge_pull_audio(Pm3Bridge*, int16_t* dst_stereo, int frames);   // returns the number of frames that held sound (the rest of dst is zeroed)
 void pm3_bridge_set_paused(Pm3Bridge*, int paused);   // 1 = freeze the guest (app went to background); its clock does not advance while paused
 void pm3_bridge_copy_frame(Pm3Bridge*, uint32_t* dst640x480);   // thread-safe copy of the current frame (use this instead of pm3_bridge_framebuffer while the game runs)
 

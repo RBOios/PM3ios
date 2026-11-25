@@ -14,6 +14,7 @@
 
 struct Pm3Bridge {
     pm3::Vfs vfs; pm3::TouchMouse touch; pm3::Viewport vp; std::vector<uint32_t> fb;
+    std::mutex amu; std::vector<int16_t> abuf;   // audio mix queue (stereo, PM3_AUDIO_RATE), guarded by amu
     std::mutex mu;                                   // guards touch queue + fb (UI thread <-> game thread)
     std::thread worker; std::atomic<bool> quit{false}, running{false}, paused{false}; std::atomic<uint64_t> paused_ms{0};
     Pm3Bridge() : fb((size_t)pm3::kGameW * pm3::kGameH, 0xFF000000u) { vp = pm3::fit_viewport(pm3::kGameW, pm3::kGameH); touch.set_viewport(vp); }
@@ -50,6 +51,8 @@ int pm3_bridge_file_exists(Pm3Bridge* b, const char* path) { return b->vfs.exist
 void pm3_bridge_copy_frame(Pm3Bridge* b, uint32_t* dst) { std::lock_guard<std::mutex> lk(b->mu); std::memcpy(dst, b->fb.data(), b->fb.size() * sizeof(uint32_t)); }
 int pm3_bridge_game_running(const Pm3Bridge* b) { return b->running.load() ? 1 : 0; }
 
+static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits);   // audio section below
+
 int pm3_bridge_start_game(Pm3Bridge* b) {
     if (b->running.load() || b->worker.joinable()) return 0;
     if (!b->vfs.exists("PM3WIN.EXE")) return 0;
@@ -58,6 +61,7 @@ int pm3_bridge_start_game(Pm3Bridge* b) {
         std::string game = b->vfs.root(); pm3::X86Hooks h; h.save_dir = b->vfs.save_dir();
         auto t0 = std::chrono::steady_clock::now();
         h.now_ms = [t0, b] { return (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() - b->paused_ms.load()); };   // guest clock skips paused time
+        h.on_pcm = [b](const uint8_t* d, uint32_t n, int ch, int rate, int bits) { push_pcm(b, d, n, ch, rate, bits); };
         h.poll_mouse = [b](int* t, int* x, int* y) { std::lock_guard<std::mutex> lk(b->mu); pm3::MouseEvent e; if (!b->touch.poll(&e)) return false; *t = (int)e.type; *x = e.x; *y = e.y; return true; };
         h.on_frame = [b](const pm3::X86Frame& f) {
             if (b->quit.load()) return false;
@@ -77,3 +81,24 @@ int pm3_bridge_start_game(Pm3Bridge* b) {
 
 void pm3_bridge_set_paused(Pm3Bridge* b, int paused) { b->paused = paused != 0; }
 void pm3_bridge_stop_game(Pm3Bridge* b) { b->quit = true; if (b->worker.joinable()) b->worker.join(); b->running = false; }
+
+// ---------------------------------------------------------------- audio
+static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits) {
+    if (!d || ch < 1 || rate < 1000 || (bits != 8 && bits != 16)) return;
+    uint32_t bps = (uint32_t)(bits / 8) * ch, n = bytes / bps; if (!n) return;
+    auto sample = [&](uint32_t i, int c) -> int32_t { const uint8_t* p = d + (size_t)i * bps + (size_t)c * (bits / 8); return bits == 8 ? ((int32_t)p[0] - 128) * 256 : (int16_t)(p[0] | (p[1] << 8)); };
+    uint64_t out_n = (uint64_t)n * PM3_AUDIO_RATE / rate; if (out_n > (uint64_t)PM3_AUDIO_RATE * 20) out_n = (uint64_t)PM3_AUDIO_RATE * 20;
+    std::lock_guard<std::mutex> lk(b->amu);
+    if (b->abuf.size() < out_n * 2) b->abuf.resize(out_n * 2, 0);
+    for (uint64_t o = 0; o < out_n; o++) {   // linear resample, mono -> both channels, 3+ channels: first two
+        double pos = (double)o * rate / PM3_AUDIO_RATE; uint32_t i0 = (uint32_t)pos; if (i0 >= n) i0 = n - 1; uint32_t i1 = i0 + 1 < n ? i0 + 1 : i0; double fr = pos - i0;
+        for (int c = 0; c < 2; c++) { int cc = ch > 1 ? c : 0; int32_t v = (int32_t)(sample(i0, cc) * (1.0 - fr) + sample(i1, cc) * fr);
+            int32_t m = (int32_t)b->abuf[o * 2 + c] + v; b->abuf[o * 2 + c] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m); } }
+}
+
+int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
+    std::lock_guard<std::mutex> lk(b->amu); size_t have = b->abuf.size() / 2, n = std::min<size_t>(have, (size_t)(frames > 0 ? frames : 0));
+    if (n) { std::memcpy(dst, b->abuf.data(), n * 2 * sizeof(int16_t)); b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(n * 2)); }
+    if ((size_t)frames > n) std::memset(dst + n * 2, 0, ((size_t)frames - n) * 2 * sizeof(int16_t));
+    return (int)n;
+}

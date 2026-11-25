@@ -20,7 +20,10 @@ struct X86Hooks {
     std::string save_dir;                                   // empty: <game_dir>/_save
     std::function<uint32_t()> now_ms;                       // wall clock for timeGetTime(); empty: guest steps / 1000 (deterministic)
     std::function<bool(const X86Frame&)> on_frame;          // after every slice; return false to stop the guest
-    std::function<bool(int* type, int* x, int* y)> poll_mouse;   // type 0 move, 1 left down, 2 left up; x/y in 640x480 game pixels
+    std::function<bool(int* type, int* x, int* y)> poll_mouse;
+    // waveOut output of the guest: raw PCM exactly as the game wrote it (bits 8 = unsigned, 16 = signed little endian). Called from the guest thread.
+    std::function<void(const uint8_t* data, uint32_t bytes, int channels, int rate, int bits)> on_pcm;
+    bool verbose = false;                                   // false: the host's trace output (API log, HLE notes) is silenced (env PM3_VERBOSE=1 turns it on)   // type 0 move, 1 left down, 2 left up; x/y in 640x480 game pixels
 };
 
 // argv[1] = game directory (contains PM3WIN.EXE), argv[2] = max steps (0 = unlimited when hooks are given). Returns 0 on a clean stop.

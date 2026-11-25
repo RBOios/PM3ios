@@ -3,6 +3,7 @@
 //   Documents/Saves holds everything the game writes. The app is pure Objective-C++: no storyboard, no SDL.
 #import <UIKit/UIKit.h>
 #import "PM3MetalView.h"
+#import "PM3Audio.h"
 #include "pm3/bridge.h"
 
 @interface PM3ViewController : UIViewController
@@ -11,6 +12,7 @@
 @implementation PM3ViewController {
     Pm3Bridge *_bridge;
     PM3MetalView *_metal;
+    PM3Audio *_audio;
     UILabel *_label;
     NSTimer *_watch;
 }
@@ -64,6 +66,8 @@
     [self.view addSubview:_metal];
 
     if (!pm3_bridge_start_game(_bridge)) { [self showMessage:@"게임을 시작하지 못했습니다."]; return; }
+    _audio = [[PM3Audio alloc] initWithBridge:_bridge];   // waveOut sound effects / voices (MIDI music is not implemented yet)
+    [_audio start];
 
     // the guest's clock must not run while the app is inactive / in the background
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
@@ -82,6 +86,7 @@
 - (void)dealloc {
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [_watch invalidate];
+    [_audio stop];
     if (_bridge) pm3_bridge_destroy(_bridge);   // stops and joins the worker
 }
 

@@ -2,6 +2,7 @@
 // Virtual machine: registry Software\NINELIVES\Princess Maker3JP\1.0 "InstPath" = C:\PM3, drives C: (fixed) and D: (CD-ROM, D:\PM3W\ID_PM3JP.DAT),
 // C:\PM3, D:\PM3W and D:\ all map to <game_dir>; files created by the game go to <game_dir>/_save. 16bpp 640x480 display, IDirectDraw/Surface/Clipper/Palette HLE.
 // Debug: BP=<hex eip> dumps registers/locals once; with WATCH=<hex addr> it single-steps from the breakpoint until that word changes.
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <sys/stat.h>
@@ -57,7 +58,11 @@ static const ApiDef kApis[] = {
 static std::string cstr(const X86& c, uint32_t a, size_t max = 80) { std::string s; for (size_t i = 0; i < max && a + i < c.mem.size() && c.mem[a + i]; i++) s += (char)c.mem[a + i]; return s; }
 
 namespace pm3 {
+static bool g_quiet = false;   // set per run: shell mode without PM3_VERBOSE
+static void hostlog(const char* fmt, ...) { if (g_quiet) return; va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); }
+
 int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
+    g_quiet = hooks && !hooks->verbose && !getenv("PM3_VERBOSE");
     if (argc < 2) { fprintf(stderr, "usage: x86_boot <game_dir> [max_steps]\n"); return 2; }
     std::string gd = argv[1]; uint64_t maxs = argc > 2 ? strtoull(argv[2], 0, 10) : (hooks ? 0ull : 20000000ull);
     std::ifstream ef(gd + "/PM3WIN.EXE", std::ios::binary); std::vector<uint8_t> exe((std::istreambuf_iterator<char>(ef)), {});
@@ -69,7 +74,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     std::map<uint32_t, uint32_t> asz;   // allocation sizes for LocalSize/HeapSize
     std::map<uint32_t, std::vector<uint32_t>> freel;   // rounded size -> freed blocks (the game loads/frees large assets constantly; a pure bump heap ran into the stack)
     auto alloc = [&](uint32_t n) { uint32_t rn = (n + 15) & ~15u; auto& fl = freel[rn]; uint32_t p;
-        if (!fl.empty()) { p = fl.back(); fl.pop_back(); std::memset(&cpu.mem[p], 0, rn); } else { p = heap; heap += rn; if (heap > 0x3D00000) printf("[heap exhausted: %u]\n", heap); }
+        if (!fl.empty()) { p = fl.back(); fl.pop_back(); std::memset(&cpu.mem[p], 0, rn); } else { p = heap; heap += rn; if (heap > 0x3D00000) hostlog("[heap exhausted: %u]\n", heap); }
         asz[p] = n; return p; };
     auto release = [&](uint32_t p) { auto it = asz.find(p); if (it == asz.end() || p < 0x800000 || p >= 0x3E00000) return; freel[(it->second + 15) & ~15u].push_back(p); asz.erase(it); };
     uint32_t cmdline = tmp; const char* cl = "PM3WIN.EXE"; cpu.write_bytes(cmdline, (const uint8_t*)cl, strlen(cl) + 1);
@@ -82,14 +87,21 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     std::map<uint32_t, VFile> files; uint32_t nextH = 0x900;
     pm3::Vfs vfs; vfs.set_root(gd); vfs.set_save_dir(hooks && !hooks->save_dir.empty() ? hooks->save_dir : gd + "/_save");   // case-insensitive lookup, drive/PM3 aliases, writes -> <game>/_save (iOS: Documents), reads prefer saves
     auto host_path = [&](const std::string& p, bool for_write) -> std::string { std::string r = for_write ? vfs.make_writable(p) : std::string(); return r.empty() ? vfs.find(p) : r; };
+    std::function<bool()> pump;   // hands the primary surface to the shell between slices of a long nested guest call (set once the surfaces exist); false = the shell wants to stop
     int msgboxes = 0; uint64_t cg_limit = 20000000ull;   // step cap of a nested guest call (loader threads decompress whole screens: raised for CreateThread)
     // nested call into guest code from inside a host function (stdcall callbacks); saves/restores all CPU state
     auto call_guest = [&](X86& c, uint32_t fn, std::initializer_list<uint32_t> args) -> uint32_t {
         uint32_t sr[8]; std::memcpy(sr, c.r, sizeof sr); uint32_t eip0 = c.eip; bool fl[7] = {c.CF, c.PF, c.AF, c.ZF, c.SF, c.DF, c.OF};
         std::vector<uint32_t> a(args); for (size_t i = a.size(); i-- > 0;) c.push32(a[i]);
-        c.push32(X86::RET_STOP); c.eip = fn; bool ok = c.run(X86::RET_STOP, cg_limit); uint32_t ret = c.r[0];
+        c.push32(X86::RET_STOP); c.eip = fn; bool ok; uint64_t used = 0, sl = (pump && hooks && hooks->slice_steps) ? hooks->slice_steps : cg_limit;
+        for (;;) {   // a loader thread can run for seconds: slice it so the shell can still redraw, pause and quit
+            uint64_t n = std::min<uint64_t>(sl, cg_limit - used), b0 = c.steps; ok = c.run(X86::RET_STOP, n); used += c.steps - b0;
+            if (ok || c.err != "step limit" || used >= cg_limit) break;
+            c.err.clear(); if (pump && !pump()) { ok = false; c.err = "stopped by the shell"; break; }
+        }
+        uint32_t ret = c.r[0];
         std::memcpy(c.r, sr, sizeof sr); c.eip = eip0; c.CF = fl[0]; c.PF = fl[1]; c.AF = fl[2]; c.ZF = fl[3]; c.SF = fl[4]; c.DF = fl[5]; c.OF = fl[6];
-        if (!ok) { printf("  [callback failed: %s]\n", c.err.c_str()); stop = true; }
+        if (!ok) { hostlog("  [callback failed: %s]\n", c.err.c_str()); stop = true; }
         return ret;
     };
     // ---- DirectDraw HLE (IDirectDraw v1/v2 + IDirectDrawSurface v1 vtable layouts) ----
@@ -112,7 +124,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     auto make_plain = [&](const char* const* names, const int* argc, int n, const char* prefix) -> uint32_t {   // objects whose methods all succeed (clipper, palette)
         uint32_t vt = alloc(4 * n), obj = alloc(16); cpu.wr32(obj, vt);
         for (int i = 0; i < n; i++) { std::string nm = std::string(prefix) + names[i]; int ac = argc[i];
-            uint32_t h = cpu.add_host([&, nm, ac](X86& c) { ddlog(nm); if (calls < 4000) printf("  [com] %s -> 0\n", nm.c_str()); calls++; c.ret_stdcall(ac, 0); });
+            uint32_t h = cpu.add_host([&, nm, ac](X86& c) { ddlog(nm); if (calls < 4000) hostlog("  [com] %s -> 0\n", nm.c_str()); calls++; c.ret_stdcall(ac, 0); });
             cpu.wr32(vt + 4 * i, h); }
         return obj;
     };
@@ -136,13 +148,13 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                         uint32_t cb = c.arg(4), ctx = c.arg(3), d = 0x1E00800; static const int bpps[] = {8, 16, 32};
                         for (int b : bpps) { for (uint32_t q = 4; q < 108; q += 4) c.wr32(d + q, 0); c.wr32(d, 108); c.wr32(d + 4, 0x100e);
                             c.wr32(d + 8, 480); c.wr32(d + 12, 640); c.wr32(d + 16, 640 * b / 8); fill_pf(c, d + 72, b); if (b == 8) c.wr32(d + 76, 0x20);
-                            printf("  [enum] mode 640x480x%d\n", b); if (!call_guest(c, cb, {d, ctx}) || stop) break; } }
+                            hostlog("  [enum] mode 640x480x%d\n", b); if (!call_guest(c, cb, {d, ctx}) || stop) break; } }
                     else if (i == 11) { uint32_t d = c.arg(1), sz = c.rd32(d); if (sz == 0 || sz > 0x200) sz = 0x180; for (uint32_t q = 4; q < sz; q += 4) c.wr32(d + q, 0);
                         c.wr32(d + 4, 0x1 | 0x40 | 0x400000 | 0x4000000 | 0x8000000); c.wr32(d + 0x30, 4u << 20); c.wr32(d + 0x34, 4u << 20); }
                     else if (i == 0) { c.wr32(c.arg(2), self); }
                 } else {
                     Surf& sf = surfs[self];
-                    if (getenv("TRACE_API") && (i == 5 || i == 7 || i == 25)) { static int nt = 0; if (nt++ < 40) printf("  [trace] Surface::%s ret@%x self=%x dst/src=%x %x\n", SFN[i], c.rd32(c.r[4]), self, c.arg(1), c.arg(2)); }
+                    if (getenv("TRACE_API") && (i == 5 || i == 7 || i == 25)) { static int nt = 0; if (nt++ < 40) hostlog("  [trace] Surface::%s ret@%x self=%x dst/src=%x %x\n", SFN[i], c.rd32(c.r[4]), self, c.arg(1), c.arg(2)); }
                     static std::map<uint32_t, int> srefs;   // COM refcount; the pixel memory of a fully released surface goes back to the heap
                     if (i == 1) { int& r = srefs.emplace(self, 1).first->second; ret = (uint32_t)++r; }
                     else if (i == 2) { int& r = srefs.emplace(self, 1).first->second; if (r > 0) r--; ret = (uint32_t)r; if (r == 0 && sf.mem && !sf.primary) { release(sf.mem); sf.mem = 0; sf.w = sf.h = 0; } }
@@ -160,8 +172,8 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                         for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) { if (bp == 2) c.wr(sf.mem + y * sf.pitch + x * 2, 2, col); else c.wr(sf.mem + y * sf.pitch + x * bp, 4, col); }
                     }
                     else if (i == 5 || i == 7) {   // Blt / BltFast: rect copy when both surfaces are ours and same depth
-                        if (getenv("BLTLOG") && i == 7) printf("  [bltfast] dst=%x%s at=(%d,%d) src=%x trans=%x ret@%x srcKey=%d\n", self, sf.primary ? "(primary)" : "", (int)c.arg(1), (int)c.arg(2), c.arg(3), c.arg(5), c.rd32(c.r[4]), surfs.count(c.arg(3)) ? 1 : 0);
-                        if (getenv("BLTLOG") && i == 5) { uint32_t dr = c.arg(1), sr = c.arg(3); printf("  [blt] dst=%x%s rect=(%d,%d,%d,%d) src=%x%s rect=(%d,%d,%d,%d) flags=%x fx_fill=%x ret@%x\n", self, sf.primary ? "(primary)" : "",
+                        if (getenv("BLTLOG") && i == 7) hostlog("  [bltfast] dst=%x%s at=(%d,%d) src=%x trans=%x ret@%x srcKey=%d\n", self, sf.primary ? "(primary)" : "", (int)c.arg(1), (int)c.arg(2), c.arg(3), c.arg(5), c.rd32(c.r[4]), surfs.count(c.arg(3)) ? 1 : 0);
+                        if (getenv("BLTLOG") && i == 5) { uint32_t dr = c.arg(1), sr = c.arg(3); hostlog("  [blt] dst=%x%s rect=(%d,%d,%d,%d) src=%x%s rect=(%d,%d,%d,%d) flags=%x fx_fill=%x ret@%x\n", self, sf.primary ? "(primary)" : "",
                             dr ? (int)c.rd32(dr) : -1, dr ? (int)c.rd32(dr + 4) : -1, dr ? (int)c.rd32(dr + 8) : -1, dr ? (int)c.rd32(dr + 12) : -1, c.arg(2), surfs.count(c.arg(2)) ? "" : "(none)",
                             sr ? (int)c.rd32(sr) : -1, sr ? (int)c.rd32(sr + 4) : -1, sr ? (int)c.rd32(sr + 8) : -1, sr ? (int)c.rd32(sr + 12) : -1, c.arg(4), c.arg(5) ? c.rd32(c.arg(5) + 80) : 0, c.rd32(c.r[4])); }
                         uint32_t src = i == 5 ? c.arg(2) : c.arg(3); uint32_t srect = i == 5 ? c.arg(3) : c.arg(4);
@@ -177,7 +189,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                                 else for (int x = 0; x < ww; x++) { uint32_t v = c.rd(ss.mem + (sy + y) * ss.pitch + (sx + x) * bp, bp == 2 ? 2 : 4); if (v >= ss.ck_lo && v <= ss.ck_hi) continue; c.wr(sf.mem + (dy + y) * sf.pitch + (dx + x) * bp, bp == 2 ? 2 : 4, v); } } }
                     }
                 }
-                if (calls < 4000) printf("  [com] %s -> %x\n", nm.c_str(), ret);
+                if (calls < 4000) hostlog("  [com] %s -> %x\n", nm.c_str(), ret);
                 calls++; c.ret_stdcall(ac, ret);
             });
             cpu.wr32(vt + 4 * i, h);
@@ -219,7 +231,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 else if (i == 13) b.pos = c.arg(1);
                 else if (i == 14) b.fmt = c.arg(1) ? c.arg(1) : b.fmt;
                 else if (i == 18) b.playing = false;
-                if (calls < 4000) printf("  [com] %s -> %x\n", nm.c_str(), ret);
+                if (calls < 4000) hostlog("  [com] %s -> %x\n", nm.c_str(), ret);
                 calls++; c.ret_stdcall(ac, ret);
             });
             cpu.wr32(vt + 4 * i, h);
@@ -242,7 +254,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                     c.wr32(d + 4, 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80); c.wr32(d + 8, 8000); c.wr32(d + 12, 48000); }
                 else if (i == 5) { uint32_t src = c.arg(1); if (dsbufs.count(src)) { DsBuf s0 = dsbufs[src]; uint32_t o = new_dsbuf(s0.size, s0.fmt, false);
                     { if (s0.size) std::memcpy(&c.mem[dsbufs[o].mem], &c.mem[s0.mem], s0.size); c.wr32(c.arg(2), o); } } }
-                if (calls < 4000) printf("  [com] %s -> %x\n", nm.c_str(), ret);
+                if (calls < 4000) hostlog("  [com] %s -> %x\n", nm.c_str(), ret);
                 calls++; c.ret_stdcall(ac, ret);
             });
             cpu.wr32(vt + 4 * i, h);
@@ -270,7 +282,22 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         return r | (g << 8) | (b << 16); };
 
     struct MEv { int t, x, y; }; std::deque<MEv> mpend; uint32_t mlast = 0;   // shell mouse events waiting to be delivered, time of the last delivery
-    int mouse_x = 320, mouse_y = 240; uint64_t idle_polls = 0;   // last cursor position given to the guest; PeekMessage polls with an empty queue in this slice
+    int mouse_x = 320, mouse_y = 240; uint64_t idle_polls = 0;
+    if (hooks && hooks->on_frame) pump = [&]() -> bool {
+        for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; fr.idle = false; fr.steps = cpu.steps; return hooks->on_frame(fr); }
+        return true; };   // last cursor position given to the guest; PeekMessage polls with an empty queue in this slice
+
+    // ---- waveOut HLE: the game's sound effects / voices. PCM goes to hooks->on_pcm; buffers complete after their playing time (guest clock) ----
+    struct WaveOut { int ch = 1, rate = 22050, bits = 16; uint32_t flags = 0, cb = 0, inst = 0; };
+    struct WavePend { uint32_t hdr, done_ms, hwo; };
+    std::map<uint32_t, WaveOut> waves; std::deque<WavePend> wpend; uint32_t next_wo = 0x7001;
+    auto host_now = [&](X86& c) -> uint32_t { return (hooks && hooks->now_ms) ? hooks->now_ms() : (uint32_t)(c.steps / 1000); };
+    auto wave_done = [&](X86& c, const WavePend& p) {   // WHDR_DONE + MM_WOM_DONE (window or function callback)
+        c.wr32(p.hdr + 16, (c.rd32(p.hdr + 16) & ~0x10u) | 1u); WaveOut& w = waves[p.hwo];
+        if ((w.flags & 0x70000) == 0x10000 && w.cb) mq.push_back({w.cb, 0x3BD, p.hwo, p.hdr});
+        else if ((w.flags & 0x70000) == 0x30000 && w.cb) call_guest(c, w.cb, {p.hwo, 0x3BD, w.inst, p.hdr, 0}); };
+    auto wave_service = [&](X86& c) { uint32_t now = host_now(c); while (!wpend.empty() && (int32_t)(now - wpend.front().done_ms) >= 0) { WavePend p = wpend.front(); wpend.pop_front(); wave_done(c, p); } };
+
     for (auto& im : img.imports) {
         auto it = defs.find(im.name); if (it == defs.end()) { fprintf(stderr, "no def for %s\n", im.name.c_str()); return 1; }
         ApiDef d = it->second; std::string nm = im.name;
@@ -300,7 +327,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "GetModuleFileNameA") { const char* p = "C:\\PM3\\PM3WIN.EXE"; c.write_bytes(a(1), (const uint8_t*)p, strlen(p) + 1); ret = (uint32_t)strlen(p); }
             else if (nm == "timeGetTime") ret = (hooks && hooks->now_ms) ? hooks->now_ms() : (uint32_t)(c.steps / 1000);
             else if (nm == "lstrlenA") ret = (uint32_t)cstr(c, a(0), 4096).size();
-            else if (nm == "ExitProcess") { printf("[ExitProcess(%u)]\n", a(0)); stop = true; }
+            else if (nm == "ExitProcess") { hostlog("[ExitProcess(%u)]\n", a(0)); stop = true; }
             else if (nm == "wsprintfA") {   // cdecl varargs: wsprintfA(buf, fmt, ...)
                 std::string fmt = cstr(c, c.arg(1), 512), out; int ai = 2;
                 for (size_t k = 0; k < fmt.size(); k++) {
@@ -323,7 +350,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 uint32_t cs = tmp + 0x400, v[12] = {a(11), a(10), a(9), a(8), a(7), a(6), a(5), a(4), a(3), a(2), a(1), a(0)}; for (int q = 0; q < 12; q++) c.wr32(cs + 4 * q, v[q]);
                 if (pr) { call_guest(c, pr, {h, 0x81, 0, cs}); uint32_t r = call_guest(c, pr, {h, 0x0001, 0, cs}); if (r == 0xFFFFFFFFu) ret = 0; }
             }
-            else if (nm == "MessageBoxA") { note = cstr(c, a(1), 120) + " | " + cstr(c, a(2), 40); ret = 1; if (++msgboxes >= 3) { printf("[stopping: repeated MessageBoxA]\n"); stop = true; } }
+            else if (nm == "MessageBoxA") { note = cstr(c, a(1), 120) + " | " + cstr(c, a(2), 40); ret = 1; if (++msgboxes >= 3) { hostlog("[stopping: repeated MessageBoxA]\n"); stop = true; } }
             else if (nm == "GetDC") ret = 0x5000;
             else if (nm == "ReleaseDC" || nm == "DeleteDC") ret = 1;
             else if (nm == "GetDeviceCaps") {   // 16bpp, 1 plane, 640x480 (a mode the EXE accepts without the colour warning)
@@ -387,6 +414,22 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "PtInRect") { int32_t x = a(1), y = a(2); ret = (x >= (int32_t)c.rd32(a(0)) && x < (int32_t)c.rd32(a(0) + 8) && y >= (int32_t)c.rd32(a(0) + 4) && y < (int32_t)c.rd32(a(0) + 12)) ? 1 : 0; }
             else if (nm == "IsRectEmpty") { ret = ((int32_t)c.rd32(a(0)) >= (int32_t)c.rd32(a(0) + 8) || (int32_t)c.rd32(a(0) + 4) >= (int32_t)c.rd32(a(0) + 12)) ? 1 : 0; }
             else if (nm == "EqualRect") { ret = 1; for (int q = 0; q < 16; q += 4) if (c.rd32(a(0) + q) != c.rd32(a(1) + q)) ret = 0; }
+            else if (nm == "waveOutOpen") { uint32_t fl = a(5); ret = 0;
+                if (!(fl & 1) && a(2)) { WaveOut w; w.ch = c.rd(a(2) + 2, 2); w.rate = (int)c.rd32(a(2) + 4); w.bits = c.rd(a(2) + 14, 2); w.flags = fl; w.cb = a(3); w.inst = a(4);
+                    if (w.ch < 1) { w.ch = 1; }
+                    if (w.bits != 8 && w.bits != 16) { w.bits = 16; }
+                    uint32_t h = next_wo++; waves[h] = w; if (a(0)) c.wr32(a(0), h); char b[96]; snprintf(b, sizeof b, "%dHz %dch %dbit cbflags=%x", w.rate, w.ch, w.bits, fl); note = b; } }
+            else if (nm == "waveOutPrepareHeader") { c.wr32(a(1) + 16, c.rd32(a(1) + 16) | 2u); ret = 0; }
+            else if (nm == "waveOutUnprepareHeader") { c.wr32(a(1) + 16, c.rd32(a(1) + 16) & ~2u); ret = 0; }
+            else if (nm == "waveOutWrite") { uint32_t hwo = a(0), hdr = a(1), data = c.rd32(hdr), len = c.rd32(hdr + 4); ret = 0; auto wi = waves.find(hwo);
+                if (wi != waves.end() && len && data && (uint64_t)data + len <= c.mem.size()) { WaveOut& w = wi->second; uint32_t bps = (uint32_t)w.rate * w.ch * (w.bits / 8), dur = bps ? (uint32_t)((uint64_t)len * 1000 / bps) : 0;
+                    uint32_t now = host_now(c), start = (!wpend.empty() && (int32_t)(wpend.back().done_ms - now) > 0) ? wpend.back().done_ms : now;
+                    c.wr32(hdr + 16, (c.rd32(hdr + 16) & ~1u) | 0x10u); wpend.push_back({hdr, start + dur, hwo});
+                    if (hooks && hooks->on_pcm) hooks->on_pcm(&c.mem[data], len, w.ch, w.rate, w.bits);
+                    char b[80]; snprintf(b, sizeof b, "%u bytes = %u ms", len, dur); note = b; }
+                else if (wi != waves.end()) c.wr32(hdr + 16, c.rd32(hdr + 16) | 1u); }
+            else if (nm == "waveOutReset") { while (!wpend.empty()) { WavePend p = wpend.front(); wpend.pop_front(); wave_done(c, p); } ret = 0; }
+            else if (nm == "waveOutClose") { waves.erase(a(0)); ret = 0; }
             else if (nm == "RegisterClassA") { std::string cn = cstr(c, c.rd32(a(0) + 36), 40); wclass[cn] = c.rd32(a(0) + 4); note = cn; ret = 0xC001 + (uint32_t)wclass.size(); }
             else if (nm == "ShowWindow") { uint32_t h = a(0), cmd = a(1); ret = 1;
                 if (cmd != 0 && !activated) { activated = true;
@@ -398,6 +441,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "GetCursorPos") { c.wr32(a(0), mouse_x); c.wr32(a(0) + 4, mouse_y); ret = 1; }
             else if (nm == "ScreenToClient") ret = 1;
             else if (nm == "PeekMessageA") {
+                wave_service(c);
                 if (hooks && hooks->poll_mouse) {   // shell events -> WM_MOUSE*; button changes are spaced >= 50 ms apart so a per-frame state sampler sees hover, press and release
                     int t, x, y; while (hooks->poll_mouse(&t, &x, &y)) mpend.push_back({t, x, y});
                     uint32_t now = hooks->now_ms ? hooks->now_ms() : (uint32_t)(c.steps / 1000);
@@ -407,15 +451,15 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 }
                 if (mq.empty()) idle_polls++;
                 if (getenv("INJECT") && mq.empty() && seen[nm] % 300000 == 0) {   // INJECT=1 : periodic mouse move/click + Enter key, to see whether the game waits for input
-                    uint32_t h = 0x1234, pos = 320 | (240u << 16); mq.push_back({h, 0x200, 0, pos}); mq.push_back({h, 0x201, 1, pos}); mq.push_back({h, 0x202, 0, pos}); mq.push_back({h, 0x100, 13, 0x1C0001}); mq.push_back({h, 0x101, 13, 0xC01C0001u}); printf("  [inject] input messages at peek #%d\n", seen[nm]); }
-                 if (mq.empty()) ret = 0; else { Msg m = mq.front(); if (getenv("MSGLOG") && m.msg != 0xF) printf("  [msg] Peek -> hwnd=%x msg=%x wp=%x lp=%x remove=%x\n", m.hwnd, m.msg, m.wp, m.lp, a(4)); fill_msg(c, a(0), m); if (a(4) & 1) { if (m.msg == 0xF) paint_pending = false; mq.pop_front(); } ret = 1; } }
+                    uint32_t h = 0x1234, pos = 320 | (240u << 16); mq.push_back({h, 0x200, 0, pos}); mq.push_back({h, 0x201, 1, pos}); mq.push_back({h, 0x202, 0, pos}); mq.push_back({h, 0x100, 13, 0x1C0001}); mq.push_back({h, 0x101, 13, 0xC01C0001u}); hostlog("  [inject] input messages at peek #%d\n", seen[nm]); }
+                 if (mq.empty()) ret = 0; else { Msg m = mq.front(); if (getenv("MSGLOG") && m.msg != 0xF) hostlog("  [msg] Peek -> hwnd=%x msg=%x wp=%x lp=%x remove=%x\n", m.hwnd, m.msg, m.wp, m.lp, a(4)); fill_msg(c, a(0), m); if (a(4) & 1) { if (m.msg == 0xF) paint_pending = false; mq.pop_front(); } ret = 1; } }
             else if (nm == "GetMessageA") { if (mq.empty()) { fill_msg(c, a(0), Msg{0, 0, 0, 0}); ret = 1; } else { Msg m = mq.front(); mq.pop_front(); if (m.msg == 0xF) paint_pending = false; fill_msg(c, a(0), m); ret = m.msg == 0x12 ? 0 : 1; } }
             else if (nm == "TranslateMessage") ret = 0;
-            else if (nm == "DispatchMessageA") { uint32_t m = a(0), h = c.rd32(m), msg = c.rd32(m + 4), wp = c.rd32(m + 8), lp = c.rd32(m + 12); if (getenv("MSGLOG")) printf("  [msg] Dispatch hwnd=%x msg=%x wp=%x lp=%x\n", h, msg, wp, lp); ret = send_msg(c, h, msg, wp, lp); }
-            else if (nm == "SendMessageA") { uint32_t h = a(0), msg = a(1), wp = a(2), lp = a(3); if (msg == 0x112 || msg == 0x10 || msg == 0x2) printf("[SendMessage msg=%x wp=%x] ret@%08x step %llu\n", msg, wp, c.rd32(c.r[4]), (unsigned long long)c.steps); ret = send_msg(c, h, msg, wp, lp); }
+            else if (nm == "DispatchMessageA") { uint32_t m = a(0), h = c.rd32(m), msg = c.rd32(m + 4), wp = c.rd32(m + 8), lp = c.rd32(m + 12); if (getenv("MSGLOG")) hostlog("  [msg] Dispatch hwnd=%x msg=%x wp=%x lp=%x\n", h, msg, wp, lp); ret = send_msg(c, h, msg, wp, lp); }
+            else if (nm == "SendMessageA") { uint32_t h = a(0), msg = a(1), wp = a(2), lp = a(3); if (msg == 0x112 || msg == 0x10 || msg == 0x2) hostlog("[SendMessage msg=%x wp=%x] ret@%08x step %llu\n", msg, wp, c.rd32(c.r[4]), (unsigned long long)c.steps); ret = send_msg(c, h, msg, wp, lp); }
             else if (nm == "CallWindowProcA") { uint32_t pr = a(0), h = a(1), msg = a(2), wp = a(3), lp = a(4); ret = pr > 0x10000 ? call_guest(c, pr, {h, msg, wp, lp}) : 0; }
             else if (nm == "PostMessageA") { mq.push_back({a(0), a(1), a(2), a(3)}); ret = 1; }
-            else if (nm == "PostQuitMessage") { printf("[PostQuitMessage(%u)] ret@%08x step %llu\n", a(0), c.rd32(c.r[4]), (unsigned long long)c.steps); mq.push_back({0, 0x12, a(0), 0}); }
+            else if (nm == "PostQuitMessage") { hostlog("[PostQuitMessage(%u)] ret@%08x step %llu\n", a(0), c.rd32(c.r[4]), (unsigned long long)c.steps); mq.push_back({0, 0x12, a(0), 0}); }
             else if (nm == "DefWindowProcA") { ret = a(1) == 0x81 ? 1 : 0; }
             else if (nm == "CreateThread") { uint32_t fn = a(2), pa = a(3), tidp = a(5); uint32_t h = 0xA000 + (uint32_t)thr.size(); if (tidp) c.wr32(tidp, 0x2000 + (uint32_t)thr.size()); char b[64]; snprintf(b, sizeof b, "start=%x (run synchronously)", fn); note = b;
                 cg_limit = 2000000000ull; uint32_t rc = call_guest(c, fn, {pa}); cg_limit = 20000000ull; thr[h] = rc; ret = h; }
@@ -450,9 +494,9 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "DirectDrawCreate") { if (!ddobj) ddobj = make_com(DDN, DDA, 24, false); c.wr32(a(1), ddobj); note = "HLE"; }
             else if (nm == "DirectSoundCreate") { if (!dsobj) dsobj = make_ds(); c.wr32(a(1), dsobj); note = "HLE"; }
             if (getenv("TRACE_API") && (nm == "mciSendCommandA" || nm == "mciGetDeviceIDA" || (nm == "PeekMessageA" && seen[nm] <= 2) || (nm == "timeGetTime" && seen[nm] <= 2) || nm == "?MIDI_FileOpen@@YAIPAXPAD@Z" || nm == "?MIDI_Play@@YAIPAXHJ@Z" || nm == "waveOutWrite" || nm == "waveOutOpen"))
-                printf("  [trace] %s ret@%x args %x %x %x %x\n", nm.c_str(), c.rd32(c.r[4]), a(0), a(1), a(2), a(3));
+                hostlog("  [trace] %s ret@%x args %x %x %x %x\n", nm.c_str(), c.rd32(c.r[4]), a(0), a(1), a(2), a(3));
             ring.push_back(nm); if (ring.size() > 12) ring.erase(ring.begin());
-            if ((calls < 4000 && seen[nm] <= 12) || stop) printf("%s%s(%s) -> %u\n", nm.c_str(), note.empty() ? "" : "", note.c_str(), ret);
+            if ((calls < 4000 && seen[nm] <= 12) || stop) hostlog("%s%s(%s) -> %u\n", nm.c_str(), note.empty() ? "" : "", note.c_str(), ret);
             calls++;
             if (d.cdecl_) { c.r[0] = ret; c.eip = c.pop32(); } else c.ret_stdcall(d.argc, ret);
             if (stop) c.eip = X86::RET_STOP;
@@ -463,15 +507,15 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     bool ok;
     if (getenv("BP")) {   // BP=0xADDR: run to that address once, dump state, then continue
         uint32_t bp = (uint32_t)strtoul(getenv("BP"), 0, 16); ok = cpu.run(bp, maxs);
-        printf("[BP %08x] eip=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x ZF=%d\n", bp, cpu.eip, cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.ZF);
-        printf("  [ebp+0]=%08x [ebp+4]=%08x\n", cpu.rd32(cpu.r[5]), cpu.rd32(cpu.r[5] + 4));
-        for (int k = 0; k < 12; k++) printf("  [ebp-%02x] = %08x\n", 4 * (k + 1), cpu.rd32(cpu.r[5] - 4 * (k + 1)));
+        hostlog("[BP %08x] eip=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x ZF=%d\n", bp, cpu.eip, cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.ZF);
+        hostlog("  [ebp+0]=%08x [ebp+4]=%08x\n", cpu.rd32(cpu.r[5]), cpu.rd32(cpu.r[5] + 4));
+        for (int k = 0; k < 12; k++) hostlog("  [ebp-%02x] = %08x\n", 4 * (k + 1), cpu.rd32(cpu.r[5] - 4 * (k + 1)));
         if (ok && getenv("WATCH")) {   // single-step until the 32-bit word at WATCH changes
             uint32_t wa = (uint32_t)strtoul(getenv("WATCH"), 0, 16), w0 = cpu.rd32(wa), prev = cpu.eip; uint64_t n = 0; bool hit = false;
-            while (n++ < 50000000ull) { prev = cpu.eip; bool r = cpu.run(X86::RET_STOP, 1); if (cpu.rd32(wa) != w0) { hit = true; break; } if (r) break; if (cpu.err != "step limit") { printf("[WATCH] stopped: %s\n", cpu.err.c_str()); break; } }
-            if (hit) { printf("[WATCH] %08x changed %08x -> %08x by instruction at %08x (now eip=%08x) after %llu steps\n", wa, w0, cpu.rd32(wa), prev, cpu.eip, (unsigned long long)n);
-                       printf("  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]); }
-            else printf("[WATCH] no change\n");
+            while (n++ < 50000000ull) { prev = cpu.eip; bool r = cpu.run(X86::RET_STOP, 1); if (cpu.rd32(wa) != w0) { hit = true; break; } if (r) break; if (cpu.err != "step limit") { hostlog("[WATCH] stopped: %s\n", cpu.err.c_str()); break; } }
+            if (hit) { hostlog("[WATCH] %08x changed %08x -> %08x by instruction at %08x (now eip=%08x) after %llu steps\n", wa, w0, cpu.rd32(wa), prev, cpu.eip, (unsigned long long)n);
+                       hostlog("  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]); }
+            else hostlog("[WATCH] no change\n");
             ok = false; cpu.err.clear(); ok = true;
         } else if (ok) { cpu.steps++; ok = cpu.run(X86::RET_STOP, maxs); }
     } else if (const char* pf = getenv("PROFILE")) {   // PROFILE=<warmup_steps>,<sample_steps> : EIP histogram (64-byte buckets) over the sample window
@@ -480,7 +524,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         std::map<uint32_t, uint64_t> hist;
         for (uint64_t i = 0; ok && i < cnt; i++) { uint32_t e = cpu.eip; if (e < 0x600000) hist[e >> 6]++; bool r = cpu.run(X86::RET_STOP, 1); if (!r && cpu.err != "step limit") { ok = false; break; } cpu.err.clear(); }
         std::vector<std::pair<uint64_t, uint32_t>> v; for (auto& kv : hist) v.push_back({kv.second, kv.first << 6}); std::sort(v.rbegin(), v.rend());
-        printf("PROFILE: %zu buckets over %llu steps\n", v.size(), (unsigned long long)cnt); for (size_t i = 0; i < v.size() && i < 25; i++) printf("  %08x  %llu\n", v[i].second, (unsigned long long)v[i].first);
+        hostlog("PROFILE: %zu buckets over %llu steps\n", v.size(), (unsigned long long)cnt); for (size_t i = 0; i < v.size() && i < 25; i++) hostlog("  %08x  %llu\n", v[i].second, (unsigned long long)v[i].first);
         ok = true;
     } else if (hooks && hooks->on_frame) {   // shell-driven: run in slices, hand the primary surface to the shell after each one
         uint64_t slice = hooks->slice_steps ? hooks->slice_steps : 200000, done = 0; ok = true;
@@ -493,22 +537,22 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             if (maxs == 1 && done == 1) break;
         }
     } else ok = cpu.run(X86::RET_STOP, maxs);
-    if (!ok) { printf("regs: eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]);
-        printf("stack:"); for (int k = 0; k < 16 && cpu.r[4] > 0x1000; k++) printf(" %08x", cpu.rd32(cpu.r[4] + 4 * k)); printf("\n"); }
-    printf("--- %s after %llu steps, %d API calls (eip %08x)  %s\n", ok ? "stopped" : "ERROR", (unsigned long long)cpu.steps, calls, cpu.eip, ok ? "" : cpu.err.c_str());
-    if (!ring.empty()) { printf("last host calls:"); for (auto& n : ring) printf(" %s", n.c_str()); printf("\n"); }
+    if (!ok) { hostlog("regs: eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]);
+        hostlog("stack:"); for (int k = 0; k < 16 && cpu.r[4] > 0x1000; k++) hostlog(" %08x", cpu.rd32(cpu.r[4] + 4 * k)); hostlog("\n"); }
+    hostlog("--- %s after %llu steps, %d API calls (eip %08x)  %s\n", ok ? "stopped" : "ERROR", (unsigned long long)cpu.steps, calls, cpu.eip, ok ? "" : cpu.err.c_str());
+    if (!ring.empty()) { hostlog("last host calls:"); for (auto& n : ring) hostlog(" %s", n.c_str()); hostlog("\n"); }
     if (getenv("STATS")) { std::vector<std::pair<int, std::string>> v; for (auto& kv : seen) v.push_back({kv.second, kv.first}); std::sort(v.rbegin(), v.rend());
-        printf("COM call counts:"); for (auto& kv : ddseen) printf(" %s=%d", kv.first.c_str(), kv.second); printf("\n");
-        printf("API call counts:"); for (auto& e : v) printf(" %s=%d", e.second.c_str(), e.first); printf("\n"); }
+        hostlog("COM call counts:"); for (auto& kv : ddseen) hostlog(" %s=%d", kv.first.c_str(), kv.second); hostlog("\n");
+        hostlog("API call counts:"); for (auto& e : v) hostlog(" %s=%d", e.second.c_str(), e.first); hostlog("\n"); }
     if (const char* dm = getenv("DUMPMEM")) {   // DUMPMEM=hexaddr,hexaddr,... : print guest dwords at exit
-        std::string l = dm; size_t i = 0; while (i < l.size()) { size_t j = l.find(',', i); if (j == std::string::npos) j = l.size(); uint32_t ad = (uint32_t)strtoul(l.substr(i, j - i).c_str(), 0, 16); printf("mem[%08x] = %08x\n", ad, cpu.rd32(ad)); i = j + 1; } }
+        std::string l = dm; size_t i = 0; while (i < l.size()) { size_t j = l.find(',', i); if (j == std::string::npos) j = l.size(); uint32_t ad = (uint32_t)strtoul(l.substr(i, j - i).c_str(), 0, 16); hostlog("mem[%08x] = %08x\n", ad, cpu.rd32(ad)); i = j + 1; } }
     if (const char* pa = getenv("DUMP_ALL")) {   // DUMP_ALL=<prefix> : write every surface as <prefix>_<n>.ppm and print its size and whether it holds any non-zero pixel
         int n = 0; for (auto& kv : surfs) { const Surf& sf = kv.second; std::string fn = std::string(pa) + "_" + std::to_string(n++) + (sf.primary ? "_primary" : "") + ".ppm";
             bool any = false; FILE* f = fopen(fn.c_str(), "wb"); if (!f) continue; fprintf(f, "P6\n%d %d\n255\n", sf.w, sf.h);
             for (int y = 0; y < sf.h; y++) for (int x = 0; x < sf.w; x++) { uint8_t rgb[3]; uint32_t v = cpu.rd(sf.mem + y * sf.pitch + x * (sf.bpp / 8), sf.bpp == 16 ? 2 : 4); if (v) any = true;
                 if (sf.bpp == 16) { rgb[0] = ((v >> 11) & 31) * 255 / 31; rgb[1] = ((v >> 5) & 63) * 255 / 63; rgb[2] = (v & 31) * 255 / 31; } else { rgb[0] = (v >> 16) & 255; rgb[1] = (v >> 8) & 255; rgb[2] = v & 255; }
                 fwrite(rgb, 1, 3, f); }
-            fclose(f); printf("surface %d: %dx%d %dbpp %s%s -> %s\n", n - 1, sf.w, sf.h, sf.bpp, sf.primary ? "PRIMARY " : "", any ? "has pixels" : "all zero", fn.c_str()); }
+            fclose(f); hostlog("surface %d: %dx%d %dbpp %s%s -> %s\n", n - 1, sf.w, sf.h, sf.bpp, sf.primary ? "PRIMARY " : "", any ? "has pixels" : "all zero", fn.c_str()); }
     }
     if (const char* po = getenv("DUMP_PRIMARY")) {   // DUMP_PRIMARY=<file.ppm> : write the primary surface (RGB565/XRGB8888) at exit
         for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; FILE* f = fopen(po, "wb"); if (!f) break;
@@ -517,9 +561,9 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 if (sf.bpp == 16) { uint32_t v = cpu.rd(sf.mem + y * sf.pitch + x * 2, 2); rgb[0] = ((v >> 11) & 31) * 255 / 31; rgb[1] = ((v >> 5) & 63) * 255 / 63; rgb[2] = (v & 31) * 255 / 31; }
                 else { uint32_t v = cpu.rd(sf.mem + y * sf.pitch + x * (sf.bpp / 8), 4); rgb[0] = (v >> 16) & 255; rgb[1] = (v >> 8) & 255; rgb[2] = v & 255; }
                 fwrite(rgb, 1, 3, f); }
-            fclose(f); printf("primary surface dumped to %s (%dx%d, %dbpp)\n", po, sf.w, sf.h, sf.bpp); break; }
+            fclose(f); hostlog("primary surface dumped to %s (%dx%d, %dbpp)\n", po, sf.w, sf.h, sf.bpp); break; }
     }
-    printf("COM methods used (first-use order):"); for (auto& n : ddorder) printf(" %s", n.c_str()); printf("\n");
+    hostlog("COM methods used (first-use order):"); for (auto& n : ddorder) hostlog(" %s", n.c_str()); hostlog("\n");
     return ok ? 0 : 1;
 }
 }  // namespace pm3

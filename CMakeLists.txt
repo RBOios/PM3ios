@@ -101,7 +101,7 @@ endif()
 
 # ---------------------------------------------------------------- native iOS app (UIKit + Metal, no SDL)
 if(IOS AND PM3_BUILD_NATIVE_APP)
-  set(PM3_NATIVE_SRC ios_native/AppDelegate.mm ios_native/PM3MetalView.mm)
+  set(PM3_NATIVE_SRC ios_native/AppDelegate.mm ios_native/PM3MetalView.mm ios_native/PM3Audio.mm)
   set(PM3_NATIVE_ICONS ${CMAKE_SOURCE_DIR}/ios/Assets.xcassets)
   add_executable(pm3native MACOSX_BUNDLE ${PM3_NATIVE_SRC} ${PM3_NATIVE_ICONS})
   set_source_files_properties(${PM3_NATIVE_ICONS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
@@ -121,5 +121,5 @@ if(IOS AND PM3_BUILD_NATIVE_APP)
     XCODE_ATTRIBUTE_ENABLE_BITCODE "NO")
   # CoreGraphics must be linked explicitly: CGRectInset (used by AppDelegate.mm) is an out-of-line function and UIKit no longer pulls it in
   # (first CI link failed with: Undefined symbols "_CGRectInset" referenced from -[PM3ViewController showMessage:]).
-  target_link_libraries(pm3native PRIVATE pm3core "-framework Foundation" "-framework UIKit" "-framework CoreGraphics" "-framework Metal" "-framework MetalKit" "-framework QuartzCore")
+  target_link_libraries(pm3native PRIVATE pm3core "-framework Foundation" "-framework UIKit" "-framework CoreGraphics" "-framework AVFoundation" "-framework AudioToolbox" "-framework Metal" "-framework MetalKit" "-framework QuartzCore")
 endif()
