@@ -61,13 +61,17 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     if (argc < 2) { fprintf(stderr, "usage: x86_boot <game_dir> [max_steps]\n"); return 2; }
     std::string gd = argv[1]; uint64_t maxs = argc > 2 ? strtoull(argv[2], 0, 10) : (hooks ? 0ull : 20000000ull);
     std::ifstream ef(gd + "/PM3WIN.EXE", std::ios::binary); std::vector<uint8_t> exe((std::istreambuf_iterator<char>(ef)), {});
-    X86 cpu; PeImage img; std::string err;
+    X86 cpu(0x4000000); PeImage img; std::string err;
     if (!PeImage::load(exe, cpu, img, &err)) { fprintf(stderr, "PE: %s\n", err.c_str()); return 1; }
-    cpu.r[4] = 0x1F00000;
+    cpu.r[4] = 0x3F00000;
     std::map<std::string, ApiDef> defs; for (auto& d : kApis) defs[d.name] = d;
-    uint32_t heap = 0x800000, tmp = 0x1E00000;   // bump allocator, scratch area for strings
+    uint32_t heap = 0x800000, tmp = 0x3E00000;   // bump allocator, scratch area for strings
     std::map<uint32_t, uint32_t> asz;   // allocation sizes for LocalSize/HeapSize
-    auto alloc = [&](uint32_t n) { uint32_t p = heap; heap += (n + 15) & ~15u; asz[p] = n; return p; };
+    std::map<uint32_t, std::vector<uint32_t>> freel;   // rounded size -> freed blocks (the game loads/frees large assets constantly; a pure bump heap ran into the stack)
+    auto alloc = [&](uint32_t n) { uint32_t rn = (n + 15) & ~15u; auto& fl = freel[rn]; uint32_t p;
+        if (!fl.empty()) { p = fl.back(); fl.pop_back(); std::memset(&cpu.mem[p], 0, rn); } else { p = heap; heap += rn; if (heap > 0x3D00000) printf("[heap exhausted: %u]\n", heap); }
+        asz[p] = n; return p; };
+    auto release = [&](uint32_t p) { auto it = asz.find(p); if (it == asz.end() || p < 0x800000 || p >= 0x3E00000) return; freel[(it->second + 15) & ~15u].push_back(p); asz.erase(it); };
     uint32_t cmdline = tmp; const char* cl = "PM3WIN.EXE"; cpu.write_bytes(cmdline, (const uint8_t*)cl, strlen(cl) + 1);
     uint32_t envblk = tmp + 0x100; // "\0\0"
     std::vector<std::string> ring; int calls = 0; bool stop = false; std::map<std::string, int> seen;
@@ -78,12 +82,12 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     std::map<uint32_t, VFile> files; uint32_t nextH = 0x900;
     pm3::Vfs vfs; vfs.set_root(gd); vfs.set_save_dir(hooks && !hooks->save_dir.empty() ? hooks->save_dir : gd + "/_save");   // case-insensitive lookup, drive/PM3 aliases, writes -> <game>/_save (iOS: Documents), reads prefer saves
     auto host_path = [&](const std::string& p, bool for_write) -> std::string { std::string r = for_write ? vfs.make_writable(p) : std::string(); return r.empty() ? vfs.find(p) : r; };
-    int msgboxes = 0;
+    int msgboxes = 0; uint64_t cg_limit = 20000000ull;   // step cap of a nested guest call (loader threads decompress whole screens: raised for CreateThread)
     // nested call into guest code from inside a host function (stdcall callbacks); saves/restores all CPU state
     auto call_guest = [&](X86& c, uint32_t fn, std::initializer_list<uint32_t> args) -> uint32_t {
         uint32_t sr[8]; std::memcpy(sr, c.r, sizeof sr); uint32_t eip0 = c.eip; bool fl[7] = {c.CF, c.PF, c.AF, c.ZF, c.SF, c.DF, c.OF};
         std::vector<uint32_t> a(args); for (size_t i = a.size(); i-- > 0;) c.push32(a[i]);
-        c.push32(X86::RET_STOP); c.eip = fn; bool ok = c.run(X86::RET_STOP, 20000000ull); uint32_t ret = c.r[0];
+        c.push32(X86::RET_STOP); c.eip = fn; bool ok = c.run(X86::RET_STOP, cg_limit); uint32_t ret = c.r[0];
         std::memcpy(c.r, sr, sizeof sr); c.eip = eip0; c.CF = fl[0]; c.PF = fl[1]; c.AF = fl[2]; c.ZF = fl[3]; c.SF = fl[4]; c.DF = fl[5]; c.OF = fl[6];
         if (!ok) { printf("  [callback failed: %s]\n", c.err.c_str()); stop = true; }
         return ret;
@@ -139,7 +143,10 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 } else {
                     Surf& sf = surfs[self];
                     if (getenv("TRACE_API") && (i == 5 || i == 7 || i == 25)) { static int nt = 0; if (nt++ < 40) printf("  [trace] Surface::%s ret@%x self=%x dst/src=%x %x\n", SFN[i], c.rd32(c.r[4]), self, c.arg(1), c.arg(2)); }
-                    if (i == 25) { uint32_t d = c.arg(2); for (uint32_t q = 4; q < 108; q += 4) c.wr32(d + q, 0); c.wr32(d, 108); c.wr32(d + 4, 0x100f | 0x800 | 1);
+                    static std::map<uint32_t, int> srefs;   // COM refcount; the pixel memory of a fully released surface goes back to the heap
+                    if (i == 1) { int& r = srefs.emplace(self, 1).first->second; ret = (uint32_t)++r; }
+                    else if (i == 2) { int& r = srefs.emplace(self, 1).first->second; if (r > 0) r--; ret = (uint32_t)r; if (r == 0 && sf.mem && !sf.primary) { release(sf.mem); sf.mem = 0; sf.w = sf.h = 0; } }
+                    else if (i == 25) { uint32_t d = c.arg(2); for (uint32_t q = 4; q < 108; q += 4) c.wr32(d + q, 0); c.wr32(d, 108); c.wr32(d + 4, 0x100f | 0x800 | 1);
                         c.wr32(d + 8, sf.h); c.wr32(d + 12, sf.w); c.wr32(d + 16, sf.pitch); c.wr32(d + 36, sf.mem); fill_pf(c, d + 72, sf.bpp); }
                     else if (i == 22) { uint32_t d = c.arg(1); c.wr32(d + 4, 0x100f); c.wr32(d + 8, sf.h); c.wr32(d + 12, sf.w); c.wr32(d + 16, sf.pitch); fill_pf(c, d + 72, sf.bpp); }
                     else if (i == 21) fill_pf(c, c.arg(1), sf.bpp);
@@ -279,12 +286,12 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "HeapAlloc") { ret = alloc(a(2)); }
             else if (nm == "LocalAlloc") { ret = alloc(a(1)); }
             else if (nm == "VirtualAlloc") { ret = a(0) ? a(0) : alloc(a(1)); }
-            else if (nm == "HeapReAlloc" || nm == "LocalReAlloc") { bool lo = nm == "LocalReAlloc"; uint32_t old = lo ? a(0) : a(2), nsz = lo ? a(1) : a(3); uint32_t n = alloc(nsz); uint32_t osz = asz.count(old) ? asz[old] : 0; std::memcpy(&c.mem[n], &c.mem[old], std::min(osz, nsz)); ret = n; }
+            else if (nm == "HeapReAlloc" || nm == "LocalReAlloc") { bool lo = nm == "LocalReAlloc"; uint32_t old = lo ? a(0) : a(2), nsz = lo ? a(1) : a(3); uint32_t n = alloc(nsz); uint32_t osz = asz.count(old) ? asz[old] : 0; std::memcpy(&c.mem[n], &c.mem[old], std::min(osz, nsz)); release(old); ret = n; }
             else if (nm == "LocalSize") ret = asz.count(a(0)) ? asz[a(0)] : 0;
             else if (nm == "HeapSize") ret = asz.count(a(2)) ? asz[a(2)] : 0;
             else if (nm == "LocalLock" || nm == "GlobalLock") ret = a(0);
             else if (nm == "LocalUnlock" || nm == "GlobalUnlock") ret = 1;
-            else if (nm == "HeapFree" || nm == "LocalFree" || nm == "VirtualFree" || nm == "HeapDestroy") ret = 1;
+            else if (nm == "HeapFree" || nm == "LocalFree" || nm == "VirtualFree" || nm == "HeapDestroy") { if (nm == "HeapFree") release(a(2)); else if (nm == "LocalFree") release(a(0)); ret = 1; }
             else if (nm == "GetFileType") ret = 2;
             else if (nm == "GetStdHandle") ret = 0x100 + a(0);
             else if (nm == "SetHandleCount") ret = a(0);
@@ -326,6 +333,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             }
             else if (nm == "GetCurrentDirectoryA") { const char* p = "C:\\PM3"; c.write_bytes(a(1), (const uint8_t*)p, strlen(p) + 1); ret = (uint32_t)strlen(p); }
             else if (nm == "GetLogicalDriveStringsA") { const char dr[] = "C:\\\0D:\\\0"; c.write_bytes(a(1), (const uint8_t*)dr, sizeof dr); ret = 6; }   // C:\ and D:\ (+ final NUL)
+            else if (nm == "GetDiskFreeSpaceA") { c.wr32(a(1), 8); c.wr32(a(2), 512); c.wr32(a(3), 400000); c.wr32(a(4), 1000000); ret = 1; note = "8 sec/cluster, 512 B/sec, 1.6 GB free"; }   // the game refuses to save "system data" when this fails
             else if (nm == "GetDriveTypeA") { std::string r = a(0) ? cstr(c, a(0), 8) : ""; note = r; ret = (!r.empty() && (r[0] == 'D' || r[0] == 'd')) ? 5 : 3; }   // D: = CD-ROM, others fixed
             else if (nm == "FindClose" || nm == "SetCurrentDirectoryA" || nm == "SystemParametersInfoA" || nm == "IsWindow") ret = 1;
             else if (nm == "GetSystemMetrics") ret = a(0) == 0 ? 640 : (a(0) == 1 ? 480 : 0);   // SM_CXSCREEN / SM_CYSCREEN
@@ -404,13 +412,13 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "GetMessageA") { if (mq.empty()) { fill_msg(c, a(0), Msg{0, 0, 0, 0}); ret = 1; } else { Msg m = mq.front(); mq.pop_front(); if (m.msg == 0xF) paint_pending = false; fill_msg(c, a(0), m); ret = m.msg == 0x12 ? 0 : 1; } }
             else if (nm == "TranslateMessage") ret = 0;
             else if (nm == "DispatchMessageA") { uint32_t m = a(0), h = c.rd32(m), msg = c.rd32(m + 4), wp = c.rd32(m + 8), lp = c.rd32(m + 12); if (getenv("MSGLOG")) printf("  [msg] Dispatch hwnd=%x msg=%x wp=%x lp=%x\n", h, msg, wp, lp); ret = send_msg(c, h, msg, wp, lp); }
-            else if (nm == "SendMessageA") { uint32_t h = a(0), msg = a(1), wp = a(2), lp = a(3); ret = send_msg(c, h, msg, wp, lp); }
+            else if (nm == "SendMessageA") { uint32_t h = a(0), msg = a(1), wp = a(2), lp = a(3); if (msg == 0x112 || msg == 0x10 || msg == 0x2) printf("[SendMessage msg=%x wp=%x] ret@%08x step %llu\n", msg, wp, c.rd32(c.r[4]), (unsigned long long)c.steps); ret = send_msg(c, h, msg, wp, lp); }
             else if (nm == "CallWindowProcA") { uint32_t pr = a(0), h = a(1), msg = a(2), wp = a(3), lp = a(4); ret = pr > 0x10000 ? call_guest(c, pr, {h, msg, wp, lp}) : 0; }
             else if (nm == "PostMessageA") { mq.push_back({a(0), a(1), a(2), a(3)}); ret = 1; }
-            else if (nm == "PostQuitMessage") { mq.push_back({0, 0x12, a(0), 0}); }
+            else if (nm == "PostQuitMessage") { printf("[PostQuitMessage(%u)] ret@%08x step %llu\n", a(0), c.rd32(c.r[4]), (unsigned long long)c.steps); mq.push_back({0, 0x12, a(0), 0}); }
             else if (nm == "DefWindowProcA") { ret = a(1) == 0x81 ? 1 : 0; }
             else if (nm == "CreateThread") { uint32_t fn = a(2), pa = a(3), tidp = a(5); uint32_t h = 0xA000 + (uint32_t)thr.size(); if (tidp) c.wr32(tidp, 0x2000 + (uint32_t)thr.size()); char b[64]; snprintf(b, sizeof b, "start=%x (run synchronously)", fn); note = b;
-                uint32_t rc = call_guest(c, fn, {pa}); thr[h] = rc; ret = h; }
+                cg_limit = 2000000000ull; uint32_t rc = call_guest(c, fn, {pa}); cg_limit = 20000000ull; thr[h] = rc; ret = h; }
             else if (nm == "GetExitCodeThread") { uint32_t h = a(0); if (a(1)) c.wr32(a(1), thr.count(h) ? thr[h] : 0); ret = 1; }
             else if (nm == "WaitForSingleObject") ret = 0;
             else if (nm == "TerminateThread") ret = 1;
@@ -485,8 +493,10 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             if (maxs == 1 && done == 1) break;
         }
     } else ok = cpu.run(X86::RET_STOP, maxs);
+    if (!ok) { printf("regs: eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]);
+        printf("stack:"); for (int k = 0; k < 16 && cpu.r[4] > 0x1000; k++) printf(" %08x", cpu.rd32(cpu.r[4] + 4 * k)); printf("\n"); }
     printf("--- %s after %llu steps, %d API calls (eip %08x)  %s\n", ok ? "stopped" : "ERROR", (unsigned long long)cpu.steps, calls, cpu.eip, ok ? "" : cpu.err.c_str());
-    if (!ok) { printf("last host calls:"); for (auto& n : ring) printf(" %s", n.c_str()); printf("\n"); }
+    if (!ring.empty()) { printf("last host calls:"); for (auto& n : ring) printf(" %s", n.c_str()); printf("\n"); }
     if (getenv("STATS")) { std::vector<std::pair<int, std::string>> v; for (auto& kv : seen) v.push_back({kv.second, kv.first}); std::sort(v.rbegin(), v.rend());
         printf("COM call counts:"); for (auto& kv : ddseen) printf(" %s=%d", kv.first.c_str(), kv.second); printf("\n");
         printf("API call counts:"); for (auto& e : v) printf(" %s=%d", e.second.c_str(), e.first); printf("\n"); }
