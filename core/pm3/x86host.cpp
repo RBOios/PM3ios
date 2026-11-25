@@ -2,6 +2,7 @@
 // Virtual machine: registry Software\NINELIVES\Princess Maker3JP\1.0 "InstPath" = C:\PM3, drives C: (fixed) and D: (CD-ROM, D:\PM3W\ID_PM3JP.DAT),
 // C:\PM3, D:\PM3W and D:\ all map to <game_dir>; files created by the game go to <game_dir>/_save. 16bpp 640x480 display, IDirectDraw/Surface/Clipper/Palette HLE.
 // Debug: BP=<hex eip> dumps registers/locals once; with WATCH=<hex addr> it single-steps from the breakpoint until that word changes.
+#include "pm3/midi.h"
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -104,6 +105,21 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         if (!ok) { hostlog("  [callback failed: %s]\n", c.err.c_str()); stop = true; }
         return ret;
     };
+    // ---- cooperative guest threads (shell mode): the game starts a loader thread and polls WaitForSingleObject(h, 0) every frame, so the thread
+    // is simply run in slices between the main thread's slices; the main thread keeps drawing and answering input while a screen loads ----
+    struct GThread { uint32_t r[8]; uint32_t eip; bool fl[7]; bool done; uint32_t exit; uint32_t handle; };
+    std::vector<GThread> gthreads; bool async_threads = hooks && hooks->on_frame;
+    auto find_thread = [&](uint32_t h) -> GThread* { for (auto& t : gthreads) if (t.handle == h) return &t; return nullptr; };
+    auto run_thread_slice = [&](X86& c, GThread& t, uint64_t n) {
+        uint32_t sr[8]; std::memcpy(sr, c.r, sizeof sr); uint32_t e0 = c.eip; bool fl[7] = {c.CF, c.PF, c.AF, c.ZF, c.SF, c.DF, c.OF};
+        std::memcpy(c.r, t.r, sizeof sr); c.eip = t.eip; c.CF = t.fl[0]; c.PF = t.fl[1]; c.AF = t.fl[2]; c.ZF = t.fl[3]; c.SF = t.fl[4]; c.DF = t.fl[5]; c.OF = t.fl[6];
+        bool ok = c.run(X86::RET_STOP, n);
+        if (ok) { t.done = true; t.exit = c.r[0]; }
+        else if (c.err == "step limit") { c.err.clear(); std::memcpy(t.r, c.r, sizeof sr); t.eip = c.eip; t.fl[0] = c.CF; t.fl[1] = c.PF; t.fl[2] = c.AF; t.fl[3] = c.ZF; t.fl[4] = c.SF; t.fl[5] = c.DF; t.fl[6] = c.OF; }
+        else { hostlog("  [thread %x failed: %s @%08x]\n", t.handle, c.err.c_str(), c.eip); c.err.clear(); t.done = true; t.exit = 0xDEAD; }
+        std::memcpy(c.r, sr, sizeof sr); c.eip = e0; c.CF = fl[0]; c.PF = fl[1]; c.AF = fl[2]; c.ZF = fl[3]; c.SF = fl[4]; c.DF = fl[5]; c.OF = fl[6];
+    };
+    auto run_threads = [&](X86& c, uint64_t n) { for (auto& t : gthreads) if (!t.done) run_thread_slice(c, t, n); };
     // ---- DirectDraw HLE (IDirectDraw v1/v2 + IDirectDrawSurface v1 vtable layouts) ----
     static const char* DDN[] = {"QueryInterface","AddRef","Release","Compact","CreateClipper","CreatePalette","CreateSurface","DuplicateSurface","EnumDisplayModes","EnumSurfaces","FlipToGDISurface","GetCaps","GetDisplayMode","GetFourCCCodes","GetGDISurface","GetMonitorFrequency","GetScanLine","GetVerticalBlankStatus","Initialize","RestoreDisplayMode","SetCooperativeLevel","SetDisplayMode","WaitForVerticalBlank","GetAvailableVidMem"};
     static const int DDA[] = {3,1,1,1,4,5,4,3,5,5,1,3,2,3,2,2,2,2,2,1,3,4,3,4};
@@ -490,10 +506,14 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "PostMessageA") { mq.push_back({a(0), a(1), a(2), a(3)}); ret = 1; }
             else if (nm == "PostQuitMessage") { hostlog("[PostQuitMessage(%u)] ret@%08x step %llu\n", a(0), c.rd32(c.r[4]), (unsigned long long)c.steps); mq.push_back({0, 0x12, a(0), 0}); }
             else if (nm == "DefWindowProcA") { ret = a(1) == 0x81 ? 1 : 0; }
-            else if (nm == "CreateThread") { uint32_t fn = a(2), pa = a(3), tidp = a(5); uint32_t h = 0xA000 + (uint32_t)thr.size(); if (tidp) c.wr32(tidp, 0x2000 + (uint32_t)thr.size()); char b[64]; snprintf(b, sizeof b, "start=%x (run synchronously)", fn); note = b;
-                cg_limit = 2000000000ull; uint32_t rc = call_guest(c, fn, {pa}); cg_limit = 20000000ull; thr[h] = rc; ret = h; }
-            else if (nm == "GetExitCodeThread") { uint32_t h = a(0); if (a(1)) c.wr32(a(1), thr.count(h) ? thr[h] : 0); ret = 1; }
-            else if (nm == "WaitForSingleObject") ret = 0;
+            else if (nm == "CreateThread") { uint32_t fn = a(2), pa = a(3), tidp = a(5); uint32_t h = 0xA000 + (uint32_t)thr.size() + (uint32_t)gthreads.size(); if (tidp) c.wr32(tidp, 0x2000 + (uint32_t)thr.size() + (uint32_t)gthreads.size()); char b[64];
+                if (async_threads) { GThread t; std::memset(&t, 0, sizeof t); uint32_t stk = alloc(0x40000); t.r[4] = stk + 0x40000 - 16; c.wr32(t.r[4], X86::RET_STOP); c.wr32(t.r[4] + 4, pa); t.eip = fn; t.handle = h; gthreads.push_back(t); snprintf(b, sizeof b, "start=%x (cooperative)", fn); note = b; }
+                else { snprintf(b, sizeof b, "start=%x (run synchronously)", fn); note = b; cg_limit = 2000000000ull; uint32_t rc = call_guest(c, fn, {pa}); cg_limit = 20000000ull; thr[h] = rc; }
+                ret = h; }
+            else if (nm == "GetExitCodeThread") { uint32_t h = a(0); GThread* t = find_thread(h); if (a(1)) c.wr32(a(1), t ? (t->done ? t->exit : 259u) : (thr.count(h) ? thr[h] : 0)); ret = 1; }
+            else if (nm == "WaitForSingleObject") { GThread* t = find_thread(a(0)); ret = 0;
+                if (t && !t->done) { if (a(1) == 0) ret = 0x102;   // WAIT_TIMEOUT: still loading (the game polls this every frame)
+                    else { uint64_t guard = 0; while (!t->done && guard < 4000000000ull && !stop) { run_thread_slice(c, *t, 200000); guard += 200000; } } } }
             else if (nm == "TerminateThread") ret = 1;
 
             else if (nm == "LoadCursorA" || nm == "LoadIconA" || nm == "LoadMenuA") ret = 0x77;
@@ -520,6 +540,13 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "CloseHandle") { auto it = files.find(a(0)); if (it != files.end()) { fclose(it->second.f); files.erase(it); } ret = 1; }
             else if (nm == "FlushFileBuffers" || nm == "SetEndOfFile") ret = 1;
             else if (nm == "MultiByteToWideChar") { uint32_t n = (int32_t)a(3) < 0 ? 0 : a(3); if (a(4) && a(5)) { for (uint32_t i = 0; i < n && i < a(5); i++) c.wr(a(4) + 2 * i, 2, c.mem[a(2) + i]); } ret = a(3) == 0xFFFFFFFFu ? (uint32_t)cstr(c, a(2), 4096).size() + 1 : n; }
+            else if (hooks && hooks->midi && nm == "?MIDI_FileOpen@@YAIPAXPAD@Z") {   // BGM file (MIDI\\Mxxx.MID) -> built-in synth
+                std::string path = cstr(c, a(1), 260); ret = 1; FILE* f = vfs.open(path, "rb");
+                if (f) { std::vector<uint8_t> d; uint8_t tmpb[4096]; size_t n; while ((n = fread(tmpb, 1, sizeof tmpb, f)) > 0) d.insert(d.end(), tmpb, tmpb + n); fclose(f); if (hooks->midi->load(d.data(), d.size())) ret = 0; }
+                note = path + (ret ? " [failed]" : ""); }
+            else if (hooks && hooks->midi && nm == "?MIDI_Play@@YAIPAXHJ@Z") { hooks->midi->play(a(2) != 0); ret = 0; }
+            else if (hooks && hooks->midi && nm == "?MIDI_Stop@@YAIPAX@Z") { hooks->midi->stop(); ret = 0; }
+            else if (hooks && hooks->midi && nm == "?MIDI_GetIsPlay@@YAHPAX@Z") ret = hooks->midi->playing() ? 1 : 0;
             else if (nm == "DirectDrawCreate") { if (!ddobj) ddobj = make_com(DDN, DDA, 24, false); c.wr32(a(1), ddobj); note = "HLE"; }
             else if (nm == "DirectSoundCreate") { if (!dsobj) dsobj = make_ds(); c.wr32(a(1), dsobj); note = "HLE"; }
             if (getenv("TRACE_API") && (nm == "mciSendCommandA" || nm == "mciGetDeviceIDA" || (nm == "PeekMessageA" && seen[nm] <= 2) || (nm == "timeGetTime" && seen[nm] <= 2) || nm == "?MIDI_FileOpen@@YAIPAXPAD@Z" || nm == "?MIDI_Play@@YAIPAXHJ@Z" || nm == "waveOutWrite" || nm == "waveOutOpen"))
@@ -561,6 +588,8 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             uint64_t n = slice; if (maxs && maxs - done < n) n = maxs - done; uint64_t polls0 = idle_polls; uint64_t before = cpu.steps;
             ok = cpu.run(X86::RET_STOP, n); done += cpu.steps - before;
             if (!ok && cpu.err == "step limit") { ok = true; cpu.err.clear(); } else if (!ok || stop) break;
+            run_threads(cpu, slice * 2);   // loader threads get their share between the main thread's slices
+            if (stop) break;
             for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp;
                 fr.idle = idle_polls - polls0 > 1000; fr.steps = cpu.steps; if (!hooks->on_frame(fr)) { ok = true; maxs = 1; done = 1; } break; }
             if (maxs == 1 && done == 1) break;

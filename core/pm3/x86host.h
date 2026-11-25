@@ -8,6 +8,8 @@
 
 namespace pm3 {
 
+class MidiPlayer;
+
 struct X86Frame {
     const uint8_t* pixels = nullptr;   // primary surface memory (valid only during the callback)
     int width = 0, height = 0, pitch = 0, bpp = 0;   // bpp 16 = RGB565 (the mode the HLE reports), 32 = XRGB8888
@@ -23,6 +25,7 @@ struct X86Hooks {
     std::function<bool(int* type, int* x, int* y)> poll_mouse;
     // waveOut output of the guest: raw PCM exactly as the game wrote it (bits 8 = unsigned, 16 = signed little endian). Called from the guest thread.
     std::function<void(const uint8_t* data, uint32_t bytes, int channels, int rate, int bits)> on_pcm;
+    MidiPlayer* midi = nullptr;                             // BGM: PMMIDI.dll's MIDI_* are served by this player (null: they stay silent stubs)
     bool verbose = false;                                   // false: the host's trace output (API log, HLE notes) is silenced (env PM3_VERBOSE=1 turns it on)   // type 0 move, 1 left down, 2 left up, 3 right down, 4 right up; x/y in 640x480 game pixels
 };
 

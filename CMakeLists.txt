@@ -16,7 +16,7 @@ option(PM3_BUILD_TOOLS "Build pm3_dump and tests (desktop only)" ON)
 option(PM3_BUILD_NATIVE_APP "Build the native iOS app (UIKit + Metal, runs PM3WIN.EXE through the x86 host)" ON)
 
 # ---------------------------------------------------------------- core (no external deps)
-add_library(pm3core STATIC core/pm3/abp.cpp core/pm3/fpa.cpp core/pm3/image.cpp core/pm3/wpc.cpp core/pm3/wmp.cpp core/pm3/evx.cpp core/pm3/scene.cpp core/pm3/wbd.cpp core/pm3/tfn.cpp core/pm3/wav.cpp core/pm3/x86.cpp core/pm3/pe.cpp core/pm3/x86host.cpp core/pm3/vfs.cpp core/pm3/display.cpp core/pm3/touch.cpp core/pm3/bridge.cpp)
+add_library(pm3core STATIC core/pm3/abp.cpp core/pm3/fpa.cpp core/pm3/image.cpp core/pm3/wpc.cpp core/pm3/wmp.cpp core/pm3/evx.cpp core/pm3/scene.cpp core/pm3/wbd.cpp core/pm3/tfn.cpp core/pm3/wav.cpp core/pm3/x86.cpp core/pm3/pe.cpp core/pm3/x86host.cpp core/pm3/vfs.cpp core/pm3/display.cpp core/pm3/touch.cpp core/pm3/midi.cpp core/pm3/bridge.cpp)
 target_include_directories(pm3core PUBLIC core)
 find_package(Threads REQUIRED)
 target_link_libraries(pm3core PUBLIC Threads::Threads)   # bridge game worker thread
@@ -42,6 +42,9 @@ if(PM3_BUILD_TOOLS AND NOT IOS)
   add_executable(pm3_tapdrive tools/pm3_tapdrive.cpp)
   target_link_libraries(pm3_tapdrive PRIVATE pm3core)
   enable_testing()
+  add_executable(midi_render tools/midi_render.cpp)
+  target_link_libraries(midi_render PRIVATE pm3core)
+
   add_executable(test_core tests/test_core.cpp)
   target_link_libraries(test_core PRIVATE pm3core)
   add_test(NAME core COMMAND test_core)

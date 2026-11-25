@@ -2,18 +2,21 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "pm3/display.h"
+#include "pm3/midi.h"
 #include "pm3/touch.h"
 #include "pm3/vfs.h"
 #include "pm3/x86host.h"
 
 struct Pm3Bridge {
     pm3::Vfs vfs; pm3::TouchMouse touch; pm3::Viewport vp; std::vector<uint32_t> fb;
+    pm3::MidiPlayer midi{44100};                      // BGM synth (PMMIDI.dll replacement); rendered inside pm3_bridge_pull_audio
     std::mutex amu; std::vector<int16_t> abuf;   // audio mix queue (stereo, PM3_AUDIO_RATE), guarded by amu
     std::mutex mu;                                   // guards touch queue + fb (UI thread <-> game thread)
     std::thread worker; std::atomic<bool> quit{false}, running{false}, paused{false}; std::atomic<uint64_t> paused_ms{0};
@@ -57,9 +60,9 @@ static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int
 int pm3_bridge_start_game(Pm3Bridge* b) {
     if (b->running.load() || b->worker.joinable()) return 0;
     if (!b->vfs.exists("PM3WIN.EXE")) return 0;
-    b->quit = false; b->running = true;
+    b->quit = false; b->running = true; b->midi.stop();
     b->worker = std::thread([b] {
-        std::string game = b->vfs.root(); pm3::X86Hooks h; h.save_dir = b->vfs.save_dir();
+        std::string game = b->vfs.root(); pm3::X86Hooks h; h.midi = &b->midi; h.save_dir = b->vfs.save_dir();
         auto t0 = std::chrono::steady_clock::now();
         h.now_ms = [t0, b] { return (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() - b->paused_ms.load()); };   // guest clock skips paused time
         h.on_pcm = [b](const uint8_t* d, uint32_t n, int ch, int rate, int bits) { push_pcm(b, d, n, ch, rate, bits); };
@@ -101,5 +104,9 @@ int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
     std::lock_guard<std::mutex> lk(b->amu); size_t have = b->abuf.size() / 2, n = std::min<size_t>(have, (size_t)(frames > 0 ? frames : 0));
     if (n) { std::memcpy(dst, b->abuf.data(), n * 2 * sizeof(int16_t)); b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(n * 2)); }
     if ((size_t)frames > n) std::memset(dst + n * 2, 0, ((size_t)frames - n) * 2 * sizeof(int16_t));
+    if (frames > 0 && !b->paused.load()) {   // BGM (soft knee above ~80% so BGM + loud voice never hard-clips): synthesize and add on top of the PCM (SE / voice)
+        std::vector<float> m((size_t)frames * 2, 0.f); b->midi.render(m.data(), frames);
+        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : (int)v); n = std::max<size_t>(n, i / 2 + 1); }
+    }
     return (int)n;
 }

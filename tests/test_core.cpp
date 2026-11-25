@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #include "pm3/abp.h"
 #include "pm3/bitreader.h"
@@ -11,6 +12,7 @@
 #include "pm3/bridge.h"
 #include "pm3/display.h"
 #include "pm3/touch.h"
+#include "pm3/midi.h"
 #include "pm3/vfs.h"
 #include <cstdlib>
 #include <sys/stat.h>
@@ -171,6 +173,19 @@ int main() {
       auto o = pm3::pcm_to_mono_rate(r, 22050); CHECK(o.size() == 22050);
       CHECK(o[0] == 0); CHECK(o[11025] > 15900 && o[11025] < 16100);   // halfway through the ramp ~ 4000*4
       bool mono = true; for (size_t i = 1; i < o.size(); i++) if (o[i] < o[i - 1]) mono = false; CHECK(mono); }
+
+    // MIDI: tiny SMF (div 48, 120 bpm = 24 ticks/0.25 s): C4 for 1 beat (0.5 s), then silence; non-loop ends, loop keeps playing
+    { std::vector<uint8_t> f = {'M','T','h','d',0,0,0,6,0,0,0,1,0,48, 'M','T','r','k',0,0,0,0};
+      std::vector<uint8_t> tr = {0,0xC0,0, 0,0x90,60,100, 48,0x80,60,0, 48,0xFF,0x2F,0};
+      f[21] = (uint8_t)tr.size(); f.insert(f.end(), tr.begin(), tr.end());
+      pm3::MidiPlayer m(44100); CHECK(m.load(f.data(), f.size())); CHECK(m.length_seconds() > 0.49 && m.length_seconds() < 0.51);
+      std::vector<float> b(44100 * 2 * 3, 0.f); m.play(false); CHECK(m.playing());
+      for (int i = 0; i < 44100 * 3; i += 441) m.render(&b[i * 2], 441);
+      auto rms = [&](int a, int z) { double e = 0; for (int i = a * 2; i < z * 2; i++) e += b[i] * b[i]; return std::sqrt(e / ((z - a) * 2)); };
+      CHECK(rms(1000, 20000) > 0.01); CHECK(rms(44100 * 2, 44100 * 3) < 1e-6); CHECK(!m.playing());
+      std::fill(b.begin(), b.end(), 0.f); m.play(true); for (int i = 0; i < 44100 * 3; i += 441) m.render(&b[i * 2], 441);
+      CHECK(m.playing()); CHECK(rms(44100 * 2 + 1000, 44100 * 2 + 20000) > 0.01);   // second loop pass still sounds
+      m.stop(); CHECK(!m.playing()); uint8_t junk[] = {1, 2, 3}; CHECK(!m.load(junk, 3)); }
 
     std::printf(fails ? "FAILED\n" : "all tests passed\n");
     return fails ? 1 : 0;
