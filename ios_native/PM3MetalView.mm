@@ -1,5 +1,7 @@
 // UNTESTED (written without Xcode/Metal available). Objective-C++ so the C++ core can be called directly.
 #import "PM3MetalView.h"
+#include <vector>
+#include "pm3/sideframe.h"
 
 static NSString *const kShader = @
     "#include <metal_stdlib>\n"
@@ -15,6 +17,9 @@ static NSString *const kShader = @
 @interface PM3MetalView () <MTKViewDelegate, UIGestureRecognizerDelegate> {
     id<MTLCommandQueue> _queue; id<MTLRenderPipelineState> _pso; id<MTLTexture> _tex;
     id<MTLSamplerState> _nearest, _linear;
+    // side panels for the letterbox bars: source art (0xAARRGGBB, loaded once) and the composed bar textures (rebuilt when the bar size changes)
+    std::vector<uint32_t> _panel[2]; int _panelW[2], _panelH[2];   // [0] = left bar art, [1] = right bar art
+    id<MTLTexture> _barTex[2]; int _barW[2], _barH[2];
     UITouch *_tracked; BOOL _multi;   // the finger that drives the left button; _multi = a second finger joined (two-finger tap = right click, no left click)
 }
 @end
@@ -27,7 +32,9 @@ static NSString *const kShader = @
         _bridge = bridge;
         self.delegate = self;
         self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-        self.clearColor = MTLClearColorMake(0, 0, 0, 1);              // letterbox bars
+        self.clearColor = MTLClearColorMake(0, 0, 0, 1);              // letterbox bars (black where no side panel is drawn)
+        _sideFrame = YES;
+        [self loadPanels];
         self.preferredFramesPerSecond = 30;                            // the original ran at ~30 fps
         self.framebufferOnly = YES;
         self.multipleTouchEnabled = YES;                               // needed to notice the 2nd finger of a two-finger tap (only the first finger drives the cursor)
@@ -62,6 +69,30 @@ static NSString *const kShader = @
 }
 - (void)layoutSubviews { [super layoutSubviews]; [self updateViewSize]; }
 - (void)setIntegerScale:(BOOL)v { _integerScale = v; [self updateViewSize]; }
+- (void)loadPanels {   // side_left.png / side_right.png (160x720 each, in the app bundle) -> 0xAARRGGBB pixels
+    NSArray<NSString *> *names = @[@"side_left.png", @"side_right.png"];
+    for (int i = 0; i < 2; i++) {
+        UIImage *img = [UIImage imageNamed:names[i]]; CGImageRef cg = img.CGImage; _panelW[i] = _panelH[i] = 0;
+        if (!cg) { NSLog(@"PM3: %@ missing from the bundle: black bars", names[i]); continue; }
+        int w = (int)CGImageGetWidth(cg), h = (int)CGImageGetHeight(cg); _panel[i].assign((size_t)w * h, 0xFF000000u);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(_panel[i].data(), w, h, 8, (size_t)w * 4, cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);   // BGRA in memory == 0xAARRGGBB
+        if (ctx) { CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg); CGContextRelease(ctx); _panelW[i] = w; _panelH[i] = h; }
+        CGColorSpaceRelease(cs);
+    }
+}
+
+// Bar texture for one side (0 = left, 1 = right) of the given pixel size; rebuilt only when the size changes.
+- (id<MTLTexture>)barTextureForSide:(int)side width:(int)w height:(int)h {
+    if (_panelW[side] < 2 || w < 2 || h < 2) return nil;
+    if (_barTex[side] && _barW[side] == w && _barH[side] == h) return _barTex[side];
+    std::vector<uint32_t> px; pm3::compose_side_bar(_panel[side].data(), _panelW[side], _panelH[side], w, h, side == 0, px);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+    id<MTLTexture> t = [self.device newTextureWithDescriptor:td]; if (!t) return nil;
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px.data() bytesPerRow:(NSUInteger)w * 4];
+    _barTex[side] = t; _barW[side] = w; _barH[side] = h; return t;
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
 
 - (void)drawInMTKView:(MTKView *)view {
@@ -76,8 +107,17 @@ static NSString *const kShader = @
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];     // clears to black = letterbox bars
     Pm3Viewport vp = pm3_bridge_viewport(_bridge); CGFloat sc = self.contentScaleFactor;
     MTLViewport mv = { vp.x * sc, vp.y * sc, vp.w * sc, vp.h * sc, 0.0, 1.0 };       // points -> pixels
-    [enc setViewport:mv];
     [enc setRenderPipelineState:_pso];
+    // Side panels in the left/right letterbox bars (only when the game fills the whole height, i.e. a screen wider than 4:3)
+    CGSize ds = view.drawableSize; int barL = (int)lround(mv.originX), barR = (int)lround(ds.width - (mv.originX + mv.width)), H = (int)lround(ds.height);
+    if (_sideFrame && fabs(mv.originY) < 2.0 && fabs(mv.height - ds.height) < 3.0) {
+        [enc setFragmentSamplerState:_linear atIndex:0];
+        if (barL >= 4) if (id<MTLTexture> t = [self barTextureForSide:0 width:barL height:H]) {
+            MTLViewport bv = { 0, 0, (double)barL, (double)H, 0.0, 1.0 }; [enc setViewport:bv]; [enc setFragmentTexture:t atIndex:0]; [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; }
+        if (barR >= 4) if (id<MTLTexture> t = [self barTextureForSide:1 width:barR height:H]) {
+            MTLViewport bv = { ds.width - barR, 0, (double)barR, (double)H, 0.0, 1.0 }; [enc setViewport:bv]; [enc setFragmentTexture:t atIndex:0]; [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; }
+    }
+    [enc setViewport:mv];
     [enc setFragmentTexture:_tex atIndex:0];
     [enc setFragmentSamplerState:(self.smooth ? _linear : _nearest) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];

@@ -381,6 +381,10 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         if (usage == 1) { uint32_t j = c.rd(table + 2 * i, 2); return (cur_pal && j < cur_pal->size()) ? (*cur_pal)[j] : (j & 255) * 0x010101u; }
         uint32_t q = c.rd32(table + 4 * i); return ((q >> 16) & 255) | (q & 0xFF00) | ((q & 255) << 16); };
 
+    std::map<std::string, std::string> vreg = {{"IMode", "9"}, {"BGM", "1"}};   // IMode "9" = keep the built-in defaults but let the EXE go on to read Sound/Talk/BGM (a missing IMode makes it skip them all)   // virtual registry values (REG_SZ)
+    std::string reg_path = (hooks && !hooks->save_dir.empty()) ? hooks->save_dir + "/pm3_registry.txt" : std::string();
+    if (!reg_path.empty()) { if (FILE* rf = fopen(reg_path.c_str(), "rb")) { char ln[600]; while (fgets(ln, sizeof ln, rf)) { std::string l(ln); while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back(); size_t e = l.find('='); if (e != std::string::npos) vreg[l.substr(0, e)] = l.substr(e + 1); } fclose(rf); } }
+    auto reg_save = [&]() { if (reg_path.empty()) return; if (FILE* rf = fopen(reg_path.c_str(), "wb")) { for (auto& kv : vreg) if (kv.first != "InstPath") fprintf(rf, "%s=%s\n", kv.first.c_str(), kv.second.c_str()); fclose(rf); } };
     for (auto& im : img.imports) {
         auto it = defs.find(im.name); if (it == defs.end()) { fprintf(stderr, "no def for %s\n", im.name.c_str()); return 1; }
         ApiDef d = it->second; std::string nm = im.name;
@@ -480,14 +484,21 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 std::string sub = cstr(c, a(1), 120); note = sub; std::string low = sub; for (auto& ch : low) ch = (char)tolower((unsigned char)ch);
                 if (low.find("ninelives") != std::string::npos) { c.wr32(a(4), 0x7000); ret = 0; } else ret = 2;
             }
-            else if (nm == "RegQueryValueExA") {   // only InstPath is known: the game folder
+            else if (nm == "RegQueryValueExA") {   // virtual registry (REG_SZ strings, saved in <save_dir>/pm3_registry.txt); InstPath = the game folder, BGM defaults to 1 (MIDI) as the installer would leave it
                 std::string val = a(1) ? cstr(c, a(1), 60) : ""; note = val;
-                if (val == "InstPath") { const char* v = "C:\\PM3"; uint32_t n = (uint32_t)strlen(v) + 1;
+                if (val == "InstPath") vreg[val] = "C:\\PM3";
+                auto it = vreg.find(val);
+                if (it != vreg.end()) { const std::string& v = it->second; uint32_t n = (uint32_t)v.size() + 1;
                     if (a(3)) c.wr32(a(3), 1);   // REG_SZ
-                    if (a(4) && a(5) && c.rd32(a(5)) >= n) c.write_bytes(a(4), (const uint8_t*)v, n);
-                    if (a(5)) { c.wr32(a(5), n); }
+                    if (a(4) && a(5) && c.rd32(a(5)) >= n) c.write_bytes(a(4), (const uint8_t*)v.c_str(), n);
+                    if (a(5)) c.wr32(a(5), n);
                     ret = 0; }
                 else { if (a(5)) c.wr32(a(5), 0); ret = 2; }   // not found: report 0 bytes (the EXE NUL-terminates at buf[*cb])
+            }
+            else if (nm == "RegSetValueExA") {   // the CONFIG screen stores its options here
+                std::string val = a(1) ? cstr(c, a(1), 60) : ""; uint32_t cb = a(5), ty = a(3);
+                if (!val.empty() && a(4) && cb && cb < 512) { std::string v((const char*)&c.mem[a(4)], cb); if (ty == 1) { size_t z = v.find('\0'); if (z != std::string::npos) v.resize(z); } else v.clear(); if (ty == 1) { vreg[val] = v; reg_save(); } }
+                note = val; ret = 0;
             }
             else if (nm == "RegCloseKey") ret = 0;
             else if (nm == "SetPixel") { Surf* sf = sdc(a(0)); ret = a(3);

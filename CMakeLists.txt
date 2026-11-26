@@ -16,7 +16,7 @@ option(PM3_BUILD_TOOLS "Build pm3_dump and tests (desktop only)" ON)
 option(PM3_BUILD_NATIVE_APP "Build the native iOS app (UIKit + Metal, runs PM3WIN.EXE through the x86 host)" ON)
 
 # ---------------------------------------------------------------- core (no external deps)
-add_library(pm3core STATIC core/pm3/abp.cpp core/pm3/fpa.cpp core/pm3/image.cpp core/pm3/wpc.cpp core/pm3/wmp.cpp core/pm3/evx.cpp core/pm3/scene.cpp core/pm3/wbd.cpp core/pm3/tfn.cpp core/pm3/wav.cpp core/pm3/x86.cpp core/pm3/pe.cpp core/pm3/x86host.cpp core/pm3/vfs.cpp core/pm3/display.cpp core/pm3/touch.cpp core/pm3/midi.cpp core/pm3/avi.cpp core/pm3/bridge.cpp)
+add_library(pm3core STATIC core/pm3/abp.cpp core/pm3/fpa.cpp core/pm3/image.cpp core/pm3/wpc.cpp core/pm3/wmp.cpp core/pm3/evx.cpp core/pm3/scene.cpp core/pm3/wbd.cpp core/pm3/tfn.cpp core/pm3/wav.cpp core/pm3/x86.cpp core/pm3/pe.cpp core/pm3/x86host.cpp core/pm3/vfs.cpp core/pm3/display.cpp core/pm3/touch.cpp core/pm3/midi.cpp core/pm3/avi.cpp core/pm3/sideframe.cpp core/pm3/bridge.cpp)
 target_include_directories(pm3core PUBLIC core)
 find_package(Threads REQUIRED)
 target_link_libraries(pm3core PUBLIC Threads::Threads)   # bridge game worker thread
@@ -56,7 +56,7 @@ endif()
 if(IOS AND PM3_BUILD_NATIVE_APP)
   set(PM3_NATIVE_SRC ios_native/AppDelegate.mm ios_native/PM3MetalView.mm ios_native/PM3Audio.mm ios_native/PM3Settings.mm ios_native/PM3GameViewController.mm ios_native/PM3LauncherViewController.mm)
   set(PM3_NATIVE_ICONS ${CMAKE_SOURCE_DIR}/ios/Assets.xcassets)
-  set(PM3_NATIVE_ART ${CMAKE_SOURCE_DIR}/ios_native/Resources/launch_bg.jpg)   # start screen artwork (UIImage imageNamed:@"launch_bg.jpg")
+  set(PM3_NATIVE_ART ${CMAKE_SOURCE_DIR}/ios_native/Resources/launch_bg.jpg ${CMAKE_SOURCE_DIR}/ios_native/Resources/side_left.png ${CMAKE_SOURCE_DIR}/ios_native/Resources/side_right.png)   # start screen artwork (UIImage imageNamed:@"launch_bg.jpg")
   add_executable(pm3native MACOSX_BUNDLE ${PM3_NATIVE_SRC} ${PM3_NATIVE_ICONS} ${PM3_NATIVE_ART})
   set_source_files_properties(${PM3_NATIVE_ICONS} ${PM3_NATIVE_ART} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
   target_include_directories(pm3native PRIVATE ios_native)
@@ -66,7 +66,7 @@ if(IOS AND PM3_BUILD_NATIVE_APP)
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.PM3ios.native"
     MACOSX_BUNDLE_BUNDLE_NAME "PM3"
     MACOSX_BUNDLE_BUNDLE_VERSION "1"
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "0.2"
     XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
     XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC "YES"

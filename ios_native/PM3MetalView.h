@@ -9,5 +9,6 @@
 @property (nonatomic, copy) void (^frameCallback)(void);
 @property (nonatomic, assign) BOOL smooth;           // NO = nearest (crisp pixels), YES = linear
 @property (nonatomic, assign) BOOL integerScale;     // snap the scale to whole numbers when >= 1
+@property (nonatomic, assign) BOOL sideFrame;        // YES (default): fill the left/right letterbox bars with the wooden side panels (pm3/sideframe.h); NO = black bars
 - (instancetype)initWithFrame:(CGRect)frame bridge:(Pm3Bridge *)bridge;
 @end
