@@ -147,7 +147,8 @@ int main() {
       pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_SFX); pk = pull_peak(22050, nullptr); CHECK(pk > 3000);
       pm3_bridge_set_volume(b, PM3_VOL_VOICE, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_VOICE); pk = pull_peak(22050, nullptr); CHECK(pk > 3000);
       pm3_bridge_set_volume(b, PM3_VOL_SFX, 0.0f); pm3_bridge_audio_preview(b, PM3_VOL_SFX); pk = pull_peak(22050, nullptr); CHECK(pk == 0);
-      pm3_bridge_set_volume(b, PM3_VOL_BGM, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_BGM); pk = pull_peak(44100, nullptr); CHECK(pk > 300);   // synth plays the arpeggio
+      pm3_bridge_set_volume(b, PM3_VOL_BGM, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_BGM); { int hb = 0; pk = pull_peak(2000, &hb); CHECK(pk > 300 && hb > 0); }   // BGM-only audio must report frames (else iOS marks the buffer silent and drops it)
+      pm3_bridge_audio_preview(b, PM3_VOL_BGM); pk = pull_peak(44100, nullptr); CHECK(pk > 300);   // synth plays the arpeggio
       pm3_bridge_audio_preview(b, PM3_VOL_BGM); pm3_bridge_set_volume(b, PM3_VOL_BGM, 0.0f); pk = pull_peak(44100, nullptr); CHECK(pk == 0);   // BGM muted
       pm3_bridge_audio_push(b, PM3_VOL_BGM, (const uint8_t*)tone.data(), 100, 1, 44100, 16); pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); CHECK(pull_peak(1000, nullptr) == 0);   // BGM cannot be pushed as PCM
       pm3_bridge_destroy(b); }

@@ -51,3 +51,9 @@
 - 영상 소리는 `on_pcm_ex(…, voice=false)`(효과음 그룹)로 나감. `on_pcm_ex` 가 없으면 `on_pcm`.
 - CMake: 런처 소스/아이콘/배경 + `avi.cpp`, `avi_dump`. `pm3_headless.cpp` 의 주석이 `set_view_size` 호출을 삼키던 줄 분리.
 - 확인: `test_core`(음량 테스트 포함) 통과, `x86_test` 143/143, 헤드리스 로고→영상 진행. iOS(.mm) 런처 코드는 이 환경에서 컴파일 불가 → CI `ipa-native` 가 첫 컴파일.
+
+## 9. BGM 이 효과음 없을 때 끊김 (fix12)
+- 증상: 뉴게임 후 BGM 이 나오다 말다 함(이름 입력/결정 누를 때 효과음이 끝나면 BGM 도 사라짐).
+- 원인: `pm3_bridge_pull_audio` 가 돌려주는 프레임 수가 효과음/음성 큐 길이만 세고 BGM 은 안 셌음(런처 병합 때 빠짐). `PM3Audio.mm` 은 이 값이 0 이면 `isSilence=YES` 로 표시 → iOS 가 그 버퍼를 무음으로 보고 버림 → BGM 단독 구간이 안 들림.
+- 수정: BGM 샘플이 있으면 반환값에 포함. `test_core` 에 BGM 단독 pull 이 프레임 수 > 0 을 돌려주는 검사 추가.
+- 디버그: `PM3_MIDILOG=1` 이면 MIDI open/play/stop 을 stderr 로 출력. 헤드리스 뉴게임→이름 입력 구간에서 M021 루프가 계속 재생됨 확인.

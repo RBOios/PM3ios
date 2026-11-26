@@ -120,7 +120,7 @@ int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
       if (nv) b->vbuf.erase(b->vbuf.begin(), b->vbuf.begin() + (ptrdiff_t)(nv * 2)); }
     if (!b->paused.load() && gb > 0.f) {   // BGM (soft knee above ~80% so BGM + loud voice never hard-clips): synthesize and add on top of the PCM (SE / voice)
         std::vector<float> m((size_t)frames * 2, 0.f); b->midi.render(m.data(), frames);
-        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f * gb, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
+        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f * gb, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); n = std::max<size_t>(n, i / 2 + 1); }   // BGM counts as sound: the return value drives AVAudioEngine's isSilence flag
     }
     return (int)n;
 }

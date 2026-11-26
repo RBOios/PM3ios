@@ -629,9 +629,9 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (hooks && hooks->midi && nm == "?MIDI_FileOpen@@YAIPAXPAD@Z") {   // BGM file (MIDI\\Mxxx.MID) -> built-in synth
                 std::string path = cstr(c, a(1), 260); ret = 1; FILE* f = vfs.open(path, "rb");
                 if (f) { std::vector<uint8_t> d; uint8_t tmpb[4096]; size_t n; while ((n = fread(tmpb, 1, sizeof tmpb, f)) > 0) d.insert(d.end(), tmpb, tmpb + n); fclose(f); if (hooks->midi->load(d.data(), d.size())) ret = 0; }
-                note = path + (ret ? " [failed]" : ""); }
-            else if (hooks && hooks->midi && nm == "?MIDI_Play@@YAIPAXHJ@Z") { hooks->midi->play(a(2) != 0); ret = 0; }
-            else if (hooks && hooks->midi && nm == "?MIDI_Stop@@YAIPAX@Z") { hooks->midi->stop(); ret = 0; }
+                note = path + (ret ? " [failed]" : ""); if (getenv("PM3_MIDILOG")) fprintf(stderr, "[midi] open %s -> %d\n", path.c_str(), (int)ret); }
+            else if (hooks && hooks->midi && nm == "?MIDI_Play@@YAIPAXHJ@Z") { hooks->midi->play(a(2) != 0); ret = 0; if (getenv("PM3_MIDILOG")) fprintf(stderr, "[midi] play loop=%u\n", a(2)); }
+            else if (hooks && hooks->midi && nm == "?MIDI_Stop@@YAIPAX@Z") { hooks->midi->stop(); ret = 0; if (getenv("PM3_MIDILOG")) fprintf(stderr, "[midi] stop\n"); }
             else if (hooks && hooks->midi && nm == "?MIDI_GetIsPlay@@YAHPAX@Z") ret = hooks->midi->playing() ? 1 : 0;
             else if (hooks && hooks->on_frame && nm == "MoveWindow" && a(0) == MOV_HWND) { mov_rx = (int)a(1); mov_ry = (int)a(2); mov_rw = (int)a(3); mov_rh = (int)a(4); ret = 1; }
             else if (hooks && hooks->on_frame && nm == "mciSendCommandA" && (a(1) == 0x803 || mov)) {
