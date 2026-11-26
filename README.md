@@ -4,5 +4,5 @@
 <img width="400" height="185" alt="3" src="https://github.com/user-attachments/assets/2c7b34fb-26c9-4fde-8e3e-700c00c7c185" />
 <img width="400" height="185" alt="4" src="https://github.com/user-attachments/assets/a42c5270-01f7-48a1-9ac4-d80c06af1a1f" />
 <br>
-* 후지쯔판 + 만트라 데이터로 작업했습니다.
+* 후지쯔판 + 만트라 데이터로 작업했습니다.<br>
 * 원본 게임은 제공하지 않습니다.
