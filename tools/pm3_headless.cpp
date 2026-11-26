@@ -25,7 +25,9 @@ int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: pm3_headless <game_dir> [save_dir] [tap_x tap_y]\n"); return 2; }
     const char* save = argc > 2 ? argv[2] : "/tmp/pm3_save"; int tx = argc > 4 ? atoi(argv[3]) : -1, ty = argc > 4 ? atoi(argv[4]) : -1;
     if (argc == 4) { tx = atoi(argv[2]); ty = atoi(argv[3]); save = "/tmp/pm3_save"; }
-    Pm3Bridge* b = pm3_bridge_create(); g_b = b; pm3_bridge_set_paths(b, argv[1], save); pm3_bridge_set_view_size(b, 640, 480, 0);
+    Pm3Bridge* b = pm3_bridge_create(); g_b = b; pm3_bridge_set_paths(b, argv[1], save);
+    { const char* names[3] = {"PM3_VOL_VOICE", "PM3_VOL_BGM", "PM3_VOL_SFX"}; for (int c = 0; c < 3; c++) if (const char* v = getenv(names[c])) pm3_bridge_set_volume(g_b, c, (float)atof(v)); }   // volume groups for testing
+    pm3_bridge_set_view_size(b, 640, 480, 0);
     if (!pm3_bridge_start_game(b)) { fprintf(stderr, "cannot start (PM3WIN.EXE missing?)\n"); return 1; }
     std::vector<uint32_t> a(640 * 480), c(640 * 480);
     wait_ms(6000); pm3_bridge_copy_frame(b, a.data());

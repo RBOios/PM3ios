@@ -32,3 +32,22 @@
 
 ## 6. 음량 비율 (fix6b)
 - 음성/효과음 : BGM ≈ 2 : 1 (`bridge.cpp` 의 `kVoiceGain=0.6`, `kBgmGain=1.54`(2.2 의 70%)). 측정: 음성 구간 RMS ≈ 5000, BGM 단독 구간 ≈ 2000~3000, 최대 피크 ≈ 24000(클리핑 없음). 바꾸려면 두 상수만 조정.
+
+## 7. 오프닝 영상(MCI avivideo) · 메이커 로고 (fix7)
+- 증상: 오프닝 영상이 안 나옴. 원인은 두 겹.
+  1. 게임 시작 때 메이커 로고(MKLGO_E/J) 페이드 → 끝나면 오프닝 재생 순서인데, 로고 단계가 시작도 못 했음. `CreatePalette` 가 0 을 돌려주고(`GDI 팔레트`), `CreateDIBSection`/`CreateCompatibleDC`/`BitBlt` 가 빈 스텁이라 로고 비트맵 생성이 실패 → 오프닝 단계로 못 넘어감.
+  2. MCI(`mciSendCommandA`)가 전부 스텁이라 영상 재생·종료 통지(`MM_MCINOTIFY`)가 없음.
+- 수정:
+  - GDI: `CreatePalette/SelectPalette/RealizePalette`(DIB_PAL_COLORS 도 팔레트 인덱스로 해석), `CreateDIBSection`(게스트 메모리에 비트 할당)/`CreateCompatibleDC`/`SelectObject`/`BitBlt`(메모리 DIB → 서피스 DC)/`Get·SetDIBColorTable`.
+  - `core/pm3/avi.{h,cpp}`: AVI(RIFF) 파서 + **Cinepak** 디코더 + IMA ADPCM. ffmpeg 출력과 400프레임 비교 시 최대 오차 1(반올림), 전체 2534프레임 디코드 0.5초 미만, ASan/UBSan 통과.
+  - MCI: OPEN(요소 이름→`MOVIE\PM3OP.AVI`, 장치 ID 반환), STATUS(HWND)/WHERE/PLAY/STOP/PAUSE/RESUME/SEEK/CLOSE. 재생 중에는 디코드한 프레임을 주 서피스 복사본 위에 합성해서 셸에 넘김(게임 메모리는 안 건드림), 소리는 `on_pcm`, 끝나면 `MM_MCINOTIFY` 전달. 화면을 누르면 게임이 `MCI_CLOSE` 로 건너뜀.
+  - 셸 모드에서만 동작(배치 도구는 예전 스텁 동작 유지).
+- 확인(리눅스 헤드리스): 로고 페이드(스테이지 1→7) → 영상 재생(꽃 장면 + 세로 자막, 영상 소리 RMS ≈1600) → 타이틀. `test_core` 통과, `x86_test` 143/143, 배치 부팅 정상.
+- 필요 파일: 게임 폴더에 `MOVIE/PM3OP.AVI` (원본 PM3.zip 안에 있음, 37MB).
+- 디버그: `PM3_STATE=1` 이면 게임 상태/모드 전환을 stderr 로 출력. 도구: `avi_dump in.avi 접두사 [프레임수]`, `pm3_tapdrive` 의 `PM3_SNAP=<개수>` (0.5초마다 화면 저장, 입력 없이 실행).
+
+## 8. 런처 병합 (fix8)
+- 기준: 사용자의 `pm3ios_native_launcher`(런처 UI, PM3Settings, 음량 3그룹 `pm3_bridge_set_volume`, `on_pcm_ex`) 위에 fix7(오프닝 영상·GDI·ADPCM·협력 스레드·디버그 도구)를 합침.
+- 영상 소리는 `on_pcm_ex(…, voice=false)`(효과음 그룹)로 나감. `on_pcm_ex` 가 없으면 `on_pcm`.
+- CMake: 런처 소스/아이콘/배경 + `avi.cpp`, `avi_dump`. `pm3_headless.cpp` 의 주석이 `set_view_size` 호출을 삼키던 줄 분리.
+- 확인: `test_core`(음량 테스트 포함) 통과, `x86_test` 143/143, 헤드리스 로고→영상 진행. iOS(.mm) 런처 코드는 이 환경에서 컴파일 불가 → CI `ipa-native` 가 첫 컴파일.

@@ -14,7 +14,7 @@ static void save_wav(const char* path){ FILE* f=fopen(path,"wb"); if(!f) return;
 int main(int argc,char**argv){
   Pm3Bridge*b=pm3_bridge_create(); g_b=b; pm3_bridge_set_paths(b,argv[1],argv[2]); pm3_bridge_set_view_size(b,640,480,0);
   if(!pm3_bridge_start_game(b)){puts("nostart");return 1;}
-  std::vector<uint32_t> fr(640*480); nap(6000); pm3_bridge_copy_frame(b,fr.data()); save("/tmp/drv_0.ppm",fr);
+  std::vector<uint32_t> fr(640*480); if(getenv("PM3_SNAP")){ for(int i=0;i<atoi(getenv("PM3_SNAP"));i++){ nap(500); pm3_bridge_copy_frame(b,fr.data()); char q[64]; sprintf(q,"/tmp/snap_%02d.ppm",i); save(q,fr);} } else nap(6000); pm3_bridge_copy_frame(b,fr.data()); save("/tmp/drv_0.ppm",fr);
   int n=1; char* s=strdup(argv[3]); for(char*t=strtok(s,";");t;t=strtok(0,";")){ int x,y,r=0; double w; sscanf(t,"%d,%d,%lf,%d",&x,&y,&w,&r);   // 4th field 1 = right click
     if(r){ pm3_bridge_right_click(b,(float)x,(float)y); } else { pm3_bridge_touch_begin(b,1,(float)x,(float)y); std::this_thread::sleep_for(std::chrono::milliseconds(120)); pm3_bridge_touch_end(b,1,(float)x,(float)y); }
     nap((int)(w*1000)); pm3_bridge_copy_frame(b,fr.data()); char p[64]; sprintf(p,"/tmp/drv_%d.ppm",n++); save(p,fr);

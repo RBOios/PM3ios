@@ -47,6 +47,15 @@ int pm3_bridge_game_running(const Pm3Bridge*);
 // Sounds that start while another is still queued are added on top of it (mixed). Silence is written when nothing is queued.
 #define PM3_AUDIO_RATE 44100
 int pm3_bridge_pull_audio(Pm3Bridge*, int16_t* dst_stereo, int frames);   // returns the number of frames that held sound (the rest of dst is zeroed)
+// Volume per sound group. The original game has no volume setting; these are applied on top of the tuned defaults (1.0 = the old fixed loudness).
+//   VOICE = the game's spoken lines (IMA ADPCM waveOut), SFX = sound effects (plain PCM waveOut), BGM = the MIDI music (built-in synth).
+enum { PM3_VOL_VOICE = 0, PM3_VOL_BGM = 1, PM3_VOL_SFX = 2 };
+void pm3_bridge_set_volume(Pm3Bridge*, int channel, float volume);   // clamped to 0..2 (0 = mute, 1 = default, 2 = double amplitude)
+float pm3_bridge_get_volume(Pm3Bridge*, int channel);
+// Plays a short sample of the group so a settings screen can let the user hear the level. BGM preview only when the game is not running.
+void pm3_bridge_audio_preview(Pm3Bridge*, int channel);
+// Queue PCM directly (VOICE or SFX; same conversion/mixing as the game's own sounds). 8-bit = unsigned, 16-bit = signed little endian.
+void pm3_bridge_audio_push(Pm3Bridge*, int channel, const uint8_t* data, uint32_t bytes, int channels, int rate, int bits);
 void pm3_bridge_set_paused(Pm3Bridge*, int paused);   // 1 = freeze the guest (app went to background); its clock does not advance while paused
 void pm3_bridge_copy_frame(Pm3Bridge*, uint32_t* dst640x480);   // thread-safe copy of the current frame (use this instead of pm3_bridge_framebuffer while the game runs)
 

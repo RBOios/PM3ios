@@ -19,7 +19,8 @@
 struct Pm3Bridge {
     pm3::Vfs vfs; pm3::TouchMouse touch; pm3::Viewport vp; std::vector<uint32_t> fb;
     pm3::MidiPlayer midi{44100};                      // BGM synth (PMMIDI.dll replacement); rendered inside pm3_bridge_pull_audio
-    std::mutex amu; std::vector<int16_t> abuf;   // audio mix queue (stereo, PM3_AUDIO_RATE), guarded by amu
+    std::mutex amu; std::vector<int16_t> abuf, vbuf;   // audio mix queues (stereo, PM3_AUDIO_RATE): abuf = sound effects, vbuf = voices; guarded by amu
+    std::atomic<float> vol[3] = {1.0f, 1.0f, 1.0f};  // PM3_VOL_VOICE / BGM / SFX
     std::mutex mu;                                   // guards touch queue + fb (UI thread <-> game thread)
     std::thread worker; std::atomic<bool> quit{false}, running{false}, paused{false}; std::atomic<uint64_t> paused_ms{0};
     Pm3Bridge() : fb((size_t)pm3::kGameW * pm3::kGameH, 0xFF000000u) { vp = pm3::fit_viewport(pm3::kGameW, pm3::kGameH); touch.set_viewport(vp); }
@@ -57,7 +58,7 @@ int pm3_bridge_file_exists(Pm3Bridge* b, const char* path) { return b->vfs.exist
 void pm3_bridge_copy_frame(Pm3Bridge* b, uint32_t* dst) { std::lock_guard<std::mutex> lk(b->mu); std::memcpy(dst, b->fb.data(), b->fb.size() * sizeof(uint32_t)); }
 int pm3_bridge_game_running(const Pm3Bridge* b) { return b->running.load() ? 1 : 0; }
 
-static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits);   // audio section below
+static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits, bool voice);   // audio section below
 
 int pm3_bridge_start_game(Pm3Bridge* b) {
     if (b->running.load() || b->worker.joinable()) return 0;
@@ -67,7 +68,7 @@ int pm3_bridge_start_game(Pm3Bridge* b) {
         std::string game = b->vfs.root(); pm3::X86Hooks h; h.midi = &b->midi; h.save_dir = b->vfs.save_dir();
         auto t0 = std::chrono::steady_clock::now();
         h.now_ms = [t0, b] { return (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() - b->paused_ms.load()); };   // guest clock skips paused time
-        h.on_pcm = [b](const uint8_t* d, uint32_t n, int ch, int rate, int bits) { push_pcm(b, d, n, ch, rate, bits); };
+        h.on_pcm_ex = [b](const uint8_t* d, uint32_t n, int ch, int rate, int bits, bool voice) { push_pcm(b, d, n, ch, rate, bits, voice); };
         h.poll_mouse = [b](int* t, int* x, int* y) { std::lock_guard<std::mutex> lk(b->mu); pm3::MouseEvent e; if (!b->touch.poll(&e)) return false; *t = (e.button == 1 && e.type != pm3::MouseEvent::Move) ? (e.type == pm3::MouseEvent::ButtonDown ? 3 : 4) : (int)e.type; *x = e.x; *y = e.y; return true; };
         h.on_frame = [b](const pm3::X86Frame& f) {
             if (b->quit.load()) return false;
@@ -89,7 +90,7 @@ void pm3_bridge_set_paused(Pm3Bridge* b, int paused) { b->paused = paused != 0; 
 void pm3_bridge_stop_game(Pm3Bridge* b) { b->quit = true; if (b->worker.joinable()) b->worker.join(); b->running = false; }
 
 // ---------------------------------------------------------------- audio
-static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits) {
+static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits, bool voice) {
     if (!d || ch < 1 || rate < 1000 || (bits != 8 && bits != 16)) return;
     uint32_t bps = (uint32_t)(bits / 8) * ch, n = bytes / bps; if (!n) return;
     if (getenv("PM3_PCMLOG")) { int pk = 0; for (uint32_t i = 0; i + (bits / 8) <= bytes; i += bits / 8) { int v = bits == 8 ? (int)d[i] - 128 : (int16_t)(d[i] | (d[i + 1] << 8)); pk = std::max(pk, v < 0 ? -v : v); } { if (getenv("PM3_PCMDUMP") && rate == 22050) { static int k = 0; char nm[64]; snprintf(nm, sizeof nm, "/tmp/pcm22_%d.raw", k++); if (FILE* f = fopen(nm, "wb")) { fwrite(d, 1, bytes, f); fclose(f); } }
@@ -97,22 +98,54 @@ static void push_pcm(Pm3Bridge* b, const uint8_t* d, uint32_t bytes, int ch, int
     auto sample = [&](uint32_t i, int c) -> int32_t { const uint8_t* p = d + (size_t)i * bps + (size_t)c * (bits / 8); return bits == 8 ? ((int32_t)p[0] - 128) * 256 : (int16_t)(p[0] | (p[1] << 8)); };
     uint64_t out_n = (uint64_t)n * PM3_AUDIO_RATE / rate; if (out_n > (uint64_t)PM3_AUDIO_RATE * 20) out_n = (uint64_t)PM3_AUDIO_RATE * 20;
     std::lock_guard<std::mutex> lk(b->amu);
-    if (b->abuf.size() < out_n * 2) b->abuf.resize(out_n * 2, 0);
+    std::vector<int16_t>& q = voice ? b->vbuf : b->abuf;   // voices and sound effects are kept apart so each group has its own volume
+    if (q.size() < out_n * 2) q.resize(out_n * 2, 0);
     for (uint64_t o = 0; o < out_n; o++) {   // linear resample, mono -> both channels, 3+ channels: first two
         double pos = (double)o * rate / PM3_AUDIO_RATE; uint32_t i0 = (uint32_t)pos; if (i0 >= n) i0 = n - 1; uint32_t i1 = i0 + 1 < n ? i0 + 1 : i0; double fr = pos - i0;
         for (int c = 0; c < 2; c++) { int cc = ch > 1 ? c : 0; int32_t v = (int32_t)(sample(i0, cc) * (1.0 - fr) + sample(i1, cc) * fr);
-            int32_t m = (int32_t)b->abuf[o * 2 + c] + v; b->abuf[o * 2 + c] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m); } }
+            int32_t m = (int32_t)q[o * 2 + c] + v; q[o * 2 + c] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m); } }
 }
 
 static const float kVoiceGain = 0.6f, kBgmGain = 1.54f;   // voice : BGM loudness about 2 : 1 (voice RMS ~8000 -> ~4800, BGM RMS ~1350 -> ~2400)
 int pm3_bridge_pull_audio(Pm3Bridge* b, int16_t* dst, int frames) {
-    std::lock_guard<std::mutex> lk(b->amu); size_t have = b->abuf.size() / 2, n = std::min<size_t>(have, (size_t)(frames > 0 ? frames : 0));
-    if (n) { std::memcpy(dst, b->abuf.data(), n * 2 * sizeof(int16_t)); b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(n * 2)); }
-    if ((size_t)frames > n) std::memset(dst + n * 2, 0, ((size_t)frames - n) * 2 * sizeof(int16_t));
-    for (int i = 0; i < frames * 2; i++) dst[i] = (int16_t)(dst[i] * kVoiceGain);
-    if (frames > 0 && !b->paused.load()) {   // BGM (soft knee above ~80% so BGM + loud voice never hard-clips): synthesize and add on top of the PCM (SE / voice)
+    if (frames <= 0) return 0;
+    const float gv = kVoiceGain * b->vol[PM3_VOL_VOICE].load(), gs = kVoiceGain * b->vol[PM3_VOL_SFX].load(), gb = kBgmGain * b->vol[PM3_VOL_BGM].load();
+    size_t n = 0;
+    { std::lock_guard<std::mutex> lk(b->amu);
+      size_t ns = std::min<size_t>(b->abuf.size() / 2, (size_t)frames), nv = std::min<size_t>(b->vbuf.size() / 2, (size_t)frames); n = std::max(ns, nv);
+      for (size_t i = 0; i < (size_t)frames * 2; i++) {   // sound effects and voices: separate gains, then summed with saturation
+          float v = 0.f; if (i < ns * 2) v += (float)b->abuf[i] * gs; if (i < nv * 2) v += (float)b->vbuf[i] * gv;
+          dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
+      if (ns) b->abuf.erase(b->abuf.begin(), b->abuf.begin() + (ptrdiff_t)(ns * 2));
+      if (nv) b->vbuf.erase(b->vbuf.begin(), b->vbuf.begin() + (ptrdiff_t)(nv * 2)); }
+    if (!b->paused.load() && gb > 0.f) {   // BGM (soft knee above ~80% so BGM + loud voice never hard-clips): synthesize and add on top of the PCM (SE / voice)
         std::vector<float> m((size_t)frames * 2, 0.f); b->midi.render(m.data(), frames);
-        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f * kBgmGain, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : (int)v); n = std::max<size_t>(n, i / 2 + 1); }
+        for (size_t i = 0; i < m.size(); i++) { if (m[i] == 0.f) continue; float v = (float)dst[i] + m[i] * 32767.f * gb, av = v < 0 ? -v : v; if (av > 26000.f) { av = 26000.f + 6767.f * std::tanh((av - 26000.f) / 6767.f); v = v < 0 ? -av : av; } dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
     }
     return (int)n;
+}
+
+void pm3_bridge_set_volume(Pm3Bridge* b, int channel, float v) { if (channel < 0 || channel > 2) return; if (!(v >= 0.f)) v = 0.f; if (v > 2.f) v = 2.f; b->vol[channel] = v; }   // NaN -> 0
+float pm3_bridge_get_volume(Pm3Bridge* b, int channel) { return (channel < 0 || channel > 2) ? 0.f : b->vol[channel].load(); }
+
+void pm3_bridge_audio_push(Pm3Bridge* b, int channel, const uint8_t* d, uint32_t bytes, int ch, int rate, int bits) {
+    if (channel != PM3_VOL_VOICE && channel != PM3_VOL_SFX) return;
+    push_pcm(b, d, bytes, ch, rate, bits, channel == PM3_VOL_VOICE);
+}
+
+void pm3_bridge_audio_preview(Pm3Bridge* b, int channel) {
+    if (channel == PM3_VOL_BGM) {   // C - E - G - C arpeggio (format 0, 96 ticks per quarter, 120 bpm); the game owns the synth while it runs
+        if (b->running.load()) return;
+        static const uint8_t smf[] = {'M','T','h','d',0,0,0,6,0,0,0,1,0,96, 'M','T','r','k',0,0,0,52,
+            0,0xFF,0x51,3,0x07,0xA1,0x20, 0,0xC0,0,
+            0,0x90,60,90, 48,0x80,60,0,  0,0x90,64,90, 48,0x80,64,0,  0,0x90,67,90, 48,0x80,67,0,  0,0x90,72,90, 96,0x80,72,0, 0,0xFF,0x2F,0};
+        b->midi.stop(); if (b->midi.load(smf, sizeof smf)) b->midi.play(false);
+        return;
+    }
+    if (channel != PM3_VOL_VOICE && channel != PM3_VOL_SFX) return;
+    const int rate = 22050; const bool voice = channel == PM3_VOL_VOICE; const int n = (int)(rate * (voice ? 0.5 : 0.3)); std::vector<int16_t> pcm((size_t)n);
+    for (int i = 0; i < n; i++) {   // decaying blip(s): SFX one high note, voice two lower notes; ~peak 9000 like the game's own sounds
+        double t = (double)i / rate, env = std::exp(-6.0 * (voice ? std::fmod(t, 0.25) : t)), f = voice ? (t < 0.25 ? 330.0 : 440.0) : 880.0;
+        pcm[(size_t)i] = (int16_t)(9000.0 * env * std::sin(6.2831853 * f * t)); }
+    push_pcm(b, (const uint8_t*)pcm.data(), (uint32_t)(pcm.size() * 2), 1, rate, 16, voice);
 }

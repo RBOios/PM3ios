@@ -3,6 +3,8 @@
 // C:\PM3, D:\PM3W and D:\ all map to <game_dir>; files created by the game go to <game_dir>/_save. 16bpp 640x480 display, IDirectDraw/Surface/Clipper/Palette HLE.
 // Debug: BP=<hex eip> dumps registers/locals once; with WATCH=<hex addr> it single-steps from the breakpoint until that word changes.
 #include "pm3/midi.h"
+#include "pm3/avi.h"
+#include <memory>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -55,27 +57,6 @@ static const ApiDef kApis[] = {
  {"?MIDI_FileOpen@@YAIPAXPAD@Z",2,1},{"?MIDI_Play@@YAIPAXHJ@Z",3,1},{"?MIDI_Stop@@YAIPAX@Z",1,1},{"?MIDI_EndDestroy@@YAXPAX@Z",1,1},{"?MIDI_InitCreate@@YAPAXPAX@Z",1,1},
  {"?MIDI_GetIsPlay@@YAHPAX@Z",1,1},{"?MIDI_CallBack@@YAXPAXPAUmidihdr_tag@@@Z",2,1},
 };
-
-// IMA/DVI ADPCM (WAVE_FORMAT 0x11) blocks -> signed 16-bit PCM, interleaved (the game's voices: 22.05 kHz mono, 512-byte blocks)
-static std::vector<int16_t> ima_adpcm_decode(const uint8_t* d, size_t len, int ch, int align) {
-    static const int8_t idx_adj[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
-    static const int16_t steps[89] = {7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767};
-    std::vector<int16_t> out; if (ch < 1 || ch > 2 || align < 4 * ch) return out;
-    for (size_t b = 0; b + 4 * ch <= len; b += align) {
-        size_t bl = std::min<size_t>(align, len - b); const uint8_t* p = d + b; int pred[2] = {0, 0}, idx[2] = {0, 0};
-        for (int c = 0; c < ch; c++) { pred[c] = (int16_t)(p[4 * c] | (p[4 * c + 1] << 8)); idx[c] = std::min<int>(88, p[4 * c + 2]); }
-        size_t ns = (bl - 4 * ch) * 2 / ch + 1, base = out.size(); out.resize(base + ns * ch);
-        for (int c = 0; c < ch; c++) out[base + c] = (int16_t)pred[c];
-        size_t pos = 4 * ch; size_t k = 1;   // per channel: groups of 4 bytes (8 samples) interleaved between channels
-        while (pos + 4 * ch <= bl) {
-            for (int c = 0; c < ch; c++) for (int j = 0; j < 4; j++) { uint8_t by = p[pos + c * 4 + j];
-                for (int h = 0; h < 2; h++) { int nib = h ? by >> 4 : by & 15, st = steps[idx[c]], df = st >> 3; if (nib & 1) df += st >> 2; if (nib & 2) df += st >> 1; if (nib & 4) df += st; if (nib & 8) pred[c] -= df; else pred[c] += df;
-                    pred[c] = std::max(-32768, std::min(32767, pred[c])); idx[c] = std::max(0, std::min(88, idx[c] + idx_adj[nib]));
-                    size_t si = k + (size_t)j * 2 + h; if (si < ns) out[base + si * ch + c] = (int16_t)pred[c]; } }
-            pos += 4 * ch; k += 8; }
-    }
-    return out;
-}
 
 static std::string cstr(const X86& c, uint32_t a, size_t max = 80) { std::string s; for (size_t i = 0; i < max && a + i < c.mem.size() && c.mem[a + i]; i++) s += (char)c.mem[a + i]; return s; }
 
@@ -350,6 +331,12 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; fr.idle = false; fr.steps = cpu.steps; return hooks->on_frame(fr); }
         return true; };   // last cursor position given to the guest; PeekMessage polls with an empty queue in this slice
 
+    // ---- GDI palettes: CreatePalette/SelectPalette bookkeeping (the logo / DIB_PAL_COLORS bitmaps index into the DC's selected palette) ----
+    std::map<uint32_t, std::vector<uint32_t>> pals; uint32_t next_pal = 0x9001; const std::vector<uint32_t>* cur_pal = nullptr;   // entries as 0x00BBGGRR
+
+    // GDI memory DCs + DIB sections (the maker-logo bitmap: CreateDIBSection -> game decodes into the bits -> BitBlt onto the surface DC)
+    struct Dib { uint32_t bits; int w, h, bpp, stride; bool topdown; uint32_t usage; std::vector<uint32_t> pal; };   // pal: 0x00BBGGRR (<= 8 bpp)
+    std::map<uint32_t, Dib> dibs; std::map<uint32_t, uint32_t> memdc; uint32_t next_dib = 0xA001, next_mdc = 0x7001;   // memdc: DC -> selected DIB handle
     // ---- waveOut HLE: the game's sound effects / voices. PCM goes to hooks->on_pcm; buffers complete after their playing time (guest clock) ----
     struct WaveOut { int ch = 1, rate = 22050, bits = 16; uint32_t flags = 0, cb = 0, inst = 0, tag = 1, align = 0; };
     struct WavePend { uint32_t hdr, done_ms, hwo; };
@@ -360,6 +347,39 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
         if ((w.flags & 0x70000) == 0x10000 && w.cb) mq.push_back({w.cb, 0x3BD, p.hwo, p.hdr});
         else if ((w.flags & 0x70000) == 0x30000 && w.cb) call_guest(c, w.cb, {p.hwo, 0x3BD, w.inst, p.hdr, 0}); };
     auto wave_service = [&](X86& c) { uint32_t now = host_now(c); while (!wpend.empty() && (int32_t)(now - wpend.front().done_ms) >= 0) { WavePend p = wpend.front(); wpend.pop_front(); wave_done(c, p); } };
+
+    // ---- MCI "avivideo" HLE: the opening movie MOVIE\PM3OP.AVI (Cinepak + IMA ADPCM). The game opens it as a child window of its main window, centres it
+    // with MoveWindow, plays with MCI_NOTIFY and waits for MM_MCINOTIFY. Here the shell composites the decoded frame over the primary surface (guest
+    // memory untouched), the soundtrack goes through on_pcm, and the notification is posted when the clock passes the last frame. Shell mode only.
+    std::unique_ptr<pm3::AviMovie> mov; const uint32_t MOV_DEV = 0x5001, MOV_HWND = 0x2222;
+    bool mov_playing = false, mov_visible = false; uint32_t mov_t0 = 0, mov_paused_el = 0, mov_cb = 0; size_t mov_apos = 0; int mov_rx = 0, mov_ry = 0, mov_rw = 0, mov_rh = 0;
+    std::vector<uint8_t> overlay;
+    auto mov_elapsed = [&](X86& c) -> uint32_t { return mov_playing ? host_now(c) - mov_t0 : mov_paused_el; };
+    auto mov_stop = [&](X86& c, bool notify_abort) {
+        if (mov_playing && mov_cb && notify_abort) mq.push_back({mov_cb, 0x3B9, 4, MOV_DEV});   // MCI_NOTIFY_ABORTED
+        mov_playing = false; mov_cb = 0; (void)c; };
+    auto mov_service = [&](X86& c) {
+        if (!mov || !mov_playing) return;
+        uint32_t el = host_now(c) - mov_t0; int total = mov->frame_count(); int target = (int)((uint64_t)el * 1000 * (uint64_t)(mov->fps() * 1000) / 1000000000ull);
+        for (int k = 0; k < 60 && mov->next_frame() <= target && mov->next_frame() < total; k++) { if (!mov->decode_next()) break; mov_visible = true; }
+        if (hooks && (hooks->on_pcm || hooks->on_pcm_ex) && !mov->audio().empty()) {   // keep ~0.4 s of soundtrack queued ahead of the clock
+            size_t ch = (size_t)mov->audio_channels(), rate = (size_t)mov->audio_rate(), want = std::min(mov->audio().size(), (size_t)(((uint64_t)el + 400) * rate / 1000) * ch);
+            if (want > mov_apos + ch * rate / 8) { { const uint8_t* pd = (const uint8_t*)(mov->audio().data() + mov_apos); uint32_t pb = (uint32_t)((want - mov_apos) * 2); if (hooks->on_pcm_ex) hooks->on_pcm_ex(pd, pb, (int)ch, (int)rate, 16, false); else hooks->on_pcm(pd, pb, (int)ch, (int)rate, 16); } mov_apos = want; } }
+        if (target >= total && mov->next_frame() >= total) { mov_playing = false; mov_paused_el = el; if (mov_cb) mq.push_back({mov_cb, 0x3B9, 1, MOV_DEV}); mov_cb = 0; mov_visible = false; hostlog("[movie] finished\n"); }
+    };
+    // Draws the current movie frame (scaled, nearest) into a copy of the primary surface; returns the frame to hand to the shell.
+    auto mov_compose = [&](X86Frame& fr) {
+        if (!mov || !mov_visible || mov->rgb().empty() || (fr.bpp != 16 && fr.bpp != 32)) return;
+        size_t bytes = (size_t)fr.pitch * fr.height; overlay.assign(fr.pixels, fr.pixels + bytes);
+        int rw = mov_rw > 0 ? mov_rw : fr.width, rh = mov_rh > 0 ? mov_rh : fr.height, rx = mov_rw > 0 ? mov_rx : 0, ry = mov_rw > 0 ? mov_ry : 0; const int sw = mov->width(), sh = mov->height(); const uint8_t* src = mov->rgb().data();
+        for (int y = 0; y < rh; y++) { int dy = ry + y; if (dy < 0 || dy >= fr.height) continue; int sy = y * sh / rh;
+            for (int x = 0; x < rw; x++) { int dx = rx + x; if (dx < 0 || dx >= fr.width) continue; const uint8_t* q = src + ((size_t)sy * sw + x * sw / rw) * 3; uint8_t* d = &overlay[(size_t)dy * fr.pitch + (size_t)dx * (fr.bpp / 8)];
+                if (fr.bpp == 16) { uint16_t v = (uint16_t)((q[0] >> 3) << 11 | (q[1] >> 2) << 5 | (q[2] >> 3)); d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); }
+                else { d[0] = q[2]; d[1] = q[1]; d[2] = q[0]; d[3] = 0; } } }
+        fr.pixels = overlay.data(); };
+    auto usage_pal_rgb = [&](X86& c, uint32_t table, uint32_t i, uint32_t usage) -> uint32_t {   // colour table entry -> 0x00BBGGRR (DIB_PAL_COLORS: WORD index into the selected palette)
+        if (usage == 1) { uint32_t j = c.rd(table + 2 * i, 2); return (cur_pal && j < cur_pal->size()) ? (*cur_pal)[j] : (j & 255) * 0x010101u; }
+        uint32_t q = c.rd32(table + 4 * i); return ((q >> 16) & 255) | (q & 0xFF00) | ((q & 255) << 16); };
 
     for (auto& im : img.imports) {
         auto it = defs.find(im.name); if (it == defs.end()) { fprintf(stderr, "no def for %s\n", im.name.c_str()); return 1; }
@@ -416,6 +436,34 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "MessageBoxA") { note = cstr(c, a(1), 120) + " | " + cstr(c, a(2), 40); ret = 1; if (++msgboxes >= 3) { hostlog("[stopping: repeated MessageBoxA]\n"); stop = true; } }
             else if (nm == "GetDC") ret = 0x5000;
             else if (nm == "ReleaseDC" || nm == "DeleteDC") ret = 1;
+            else if (nm == "CreatePalette") { uint32_t lp = a(0), n = c.rd(lp + 2, 2); std::vector<uint32_t> e(n ? n : 1, 0); for (uint32_t i = 0; i < n && i < 1024; i++) e[i] = c.rd32(lp + 4 + 4 * i) & 0xFFFFFF; ret = next_pal++; pals[ret] = e; }
+            else if (nm == "SelectPalette") { auto it = pals.find(a(1)); cur_pal = it == pals.end() ? nullptr : &it->second; ret = 0x9000; }
+            else if (nm == "RealizePalette") ret = cur_pal ? (uint32_t)cur_pal->size() : 0;
+            else if (nm == "CreateDIBSection") {   // hdc, bmi, usage, ppvBits, hSection, offset
+                uint32_t bmi = a(1), hs = c.rd32(bmi); Dib d; d.w = (int32_t)c.rd32(bmi + 4); int hh = (int32_t)c.rd32(bmi + 8); d.topdown = hh < 0; d.h = hh < 0 ? -hh : hh; d.bpp = (int)c.rd(bmi + 14, 2); d.usage = a(2);
+                if (d.w > 0 && d.h > 0 && d.w <= 4096 && d.h <= 4096 && (d.bpp == 8 || d.bpp == 16 || d.bpp == 24 || d.bpp == 32 || d.bpp == 4 || d.bpp == 1)) {
+                    d.stride = (d.w * d.bpp + 31) / 32 * 4; d.bits = alloc((uint32_t)d.stride * d.h); std::memset(&c.mem[d.bits], 0, (size_t)d.stride * d.h);
+                    if (d.bpp <= 8) { uint32_t n = c.rd32(bmi + 32); if (!n) n = 1u << d.bpp; d.pal.assign(1u << d.bpp, 0); for (uint32_t i = 0; i < n && i < d.pal.size(); i++) d.pal[i] = usage_pal_rgb(c, bmi + hs, i, d.usage); }
+                    if (a(3)) c.wr32(a(3), d.bits);
+                    ret = next_dib++; dibs[ret] = d; note = std::to_string(d.w) + "x" + std::to_string(d.h) + "x" + std::to_string(d.bpp); } }
+            else if (nm == "CreateCompatibleDC") { ret = next_mdc++; memdc[ret] = 0; }
+            else if (nm == "SelectObject") { auto m = memdc.find(a(0)); if (m != memdc.end() && dibs.count(a(1))) { ret = m->second ? m->second : 0x5001; m->second = a(1); } else ret = 0x5001; }
+            else if (nm == "DeleteDC") { memdc.erase(a(0)); ret = 1; }
+            else if (nm == "DeleteObject") { dibs.erase(a(0)); pals.erase(a(0)); ret = 1; }
+            else if (nm == "SetDIBColorTable" || nm == "GetDIBColorTable") {   // hdc, start, n, rgbquad*
+                auto m = memdc.find(a(0)); ret = 0; if (m != memdc.end() && dibs.count(m->second)) { Dib& d = dibs[m->second]; uint32_t st = a(1), n = a(2);
+                    for (uint32_t i = 0; i < n && st + i < d.pal.size(); i++) { if (nm[0] == 'S') { uint32_t q = c.rd32(a(3) + 4 * i); d.pal[st + i] = ((q >> 16) & 255) | (q & 0xFF00) | ((q & 255) << 16); } else { uint32_t e = d.pal[st + i]; c.wr32(a(3) + 4 * i, ((e & 255) << 16) | (e & 0xFF00) | ((e >> 16) & 255)); } ret++; } } }
+            else if (nm == "BitBlt") {   // hdcDst, x, y, w, h, hdcSrc, xs, ys, rop : memory DIB -> surface DC
+                Surf* sf = sdc(a(0)); auto m = memdc.find(a(5)); ret = 0;
+                if (sf && m != memdc.end() && dibs.count(m->second)) { const Dib& d = dibs[m->second]; int xD = (int)a(1), yD = (int)a(2), w = (int)a(3), h = (int)a(4), xS = (int)a(6), yS = (int)a(7), bp = sf->bpp / 8;
+                    for (int r = 0; r < h; r++) { int dy = yD + r, sy = yS + r; if (dy < 0 || dy >= sf->h || sy < 0 || sy >= d.h) continue; uint32_t row = d.bits + (uint32_t)(d.topdown ? sy : d.h - 1 - sy) * d.stride;
+                        for (int q = 0; q < w; q++) { int dx = xD + q, sx = xS + q; if (dx < 0 || dx >= sf->w || sx < 0 || sx >= d.w) continue; uint32_t rr = 0, gg = 0, bb = 0;
+                            if (d.bpp <= 8) { uint32_t i = d.bpp == 8 ? c.rd8(row + sx) : d.bpp == 4 ? ((sx & 1) ? c.rd8(row + (sx >> 1)) & 15 : c.rd8(row + (sx >> 1)) >> 4) : (c.rd8(row + (sx >> 3)) >> (7 - (sx & 7))) & 1;
+                                uint32_t e = i < d.pal.size() ? d.pal[i] : 0; if (d.usage == 1 && cur_pal && i < cur_pal->size()) e = (*cur_pal)[i]; rr = e & 255; gg = (e >> 8) & 255; bb = (e >> 16) & 255; }
+                            else if (d.bpp == 16) { uint32_t v = c.rd(row + 2 * sx, 2); rr = ((v >> 10) & 31) << 3; gg = ((v >> 5) & 31) << 3; bb = (v & 31) << 3; }
+                            else { bb = c.rd8(row + (d.bpp / 8) * sx); gg = c.rd8(row + (d.bpp / 8) * sx + 1); rr = c.rd8(row + (d.bpp / 8) * sx + 2); }
+                            c.wr(sf->mem + dy * sf->pitch + dx * bp, bp == 2 ? 2 : 4, pack_px(*sf, rr, gg, bb)); } }
+                    ret = 1; } }
             else if (nm == "GetDeviceCaps") {   // 16bpp, 1 plane, 640x480 (a mode the EXE accepts without the colour warning)
                 uint32_t idx = a(1); note = "index=" + std::to_string(idx);
                 switch (idx) { case 12: ret = 16; break; case 14: ret = 1; break; case 8: ret = 640; break; case 10: ret = 480; break;
@@ -452,14 +500,17 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 if (sf) { int xD = (int)a(1), yD = (int)a(2), w = (int)a(3), h = (int)a(4), xS = (int)a(5), yS = (int)a(6), st = (int)a(7), cl = (int)a(8); uint32_t bits = a(9), bmi = a(10);
                     uint32_t hs = c.rd32(bmi); int bw = (int32_t)c.rd32(bmi + 4), bh = (int32_t)c.rd32(bmi + 8), bc = c.rd(bmi + 14, 2); uint32_t used = c.rd32(bmi + 32);
                     if (getenv("DIBLOG")) hostlog("  [dib] surf=%x dst=(%d,%d) %dx%d src=(%d,%d) startScan=%d lines=%d bmp=%dx%d bpp=%d comp=%u used=%u hs=%u\n", (unsigned)sf->obj, xD, yD, w, h, xS, yS, st, cl, bw, bh, bc, c.rd32(bmi + 16), used, hs);
-                    bool topdown = bh < 0; uint32_t stride = ((uint32_t)bw * bc + 31) / 32 * 4; uint32_t pal = bmi + hs; if (bc <= 8 && used == 0) used = 1u << bc;
+                    uint32_t usage = a(11); bool topdown = bh < 0; uint32_t stride = ((uint32_t)bw * bc + 31) / 32 * 4; uint32_t pal = bmi + hs; if (bc <= 8 && used == 0) used = 1u << bc;
+                    auto palc = [&](uint32_t i, uint32_t& rr, uint32_t& gg, uint32_t& bb) {   // colour table entry i: RGBQUAD, or (DIB_PAL_COLORS) a WORD index into the DC's selected palette
+                        if (usage == 1) { uint32_t j = c.rd(pal + 2 * i, 2); if (cur_pal && j < cur_pal->size()) { uint32_t e = (*cur_pal)[j]; rr = e & 255; gg = (e >> 8) & 255; bb = (e >> 16) & 255; } else rr = gg = bb = j & 255; }
+                        else { bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); } };
                     int bp = sf->bpp / 8;
                     for (int r = 0; r < h; r++) { int sr = topdown ? (yS + r) : (yS + (h - 1 - r)); int line = sr - st; if (line < 0 || line >= cl) continue; int dy = yD + r; if (dy < 0 || dy >= sf->h) continue;
                         uint32_t row = bits + (uint32_t)line * stride;
                         for (int q = 0; q < w; q++) { int sx = xS + q, dx = xD + q; if (dx < 0 || dx >= sf->w || sx < 0 || sx >= bw) continue; uint32_t rr, gg, bb;
-                            if (bc == 4) { uint32_t i = c.rd8(row + (sx >> 1)); i = (sx & 1) ? (i & 15) : (i >> 4); if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }   // 4 bpp: high nibble = left pixel (the title-menu button plates)
-                            else if (bc == 1) { uint32_t i = (c.rd8(row + (sx >> 3)) >> (7 - (sx & 7))) & 1; if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }
-                            else if (bc == 8) { uint32_t i = c.rd8(row + sx); if (i >= used) i = 0; bb = c.rd8(pal + 4 * i); gg = c.rd8(pal + 4 * i + 1); rr = c.rd8(pal + 4 * i + 2); }
+                            if (bc == 4) { uint32_t i = c.rd8(row + (sx >> 1)); i = (sx & 1) ? (i & 15) : (i >> 4); if (i >= used) i = 0; palc(i, rr, gg, bb); }   // 4 bpp: high nibble = left pixel (the title-menu button plates)
+                            else if (bc == 1) { uint32_t i = (c.rd8(row + (sx >> 3)) >> (7 - (sx & 7))) & 1; if (i >= used) i = 0; palc(i, rr, gg, bb); }
+                            else if (bc == 8) { uint32_t i = c.rd8(row + sx); if (i >= used) i = 0; palc(i, rr, gg, bb); }
                             else if (bc == 24) { bb = c.rd8(row + 3 * sx); gg = c.rd8(row + 3 * sx + 1); rr = c.rd8(row + 3 * sx + 2); }
                             else if (bc == 32) { bb = c.rd8(row + 4 * sx); gg = c.rd8(row + 4 * sx + 1); rr = c.rd8(row + 4 * sx + 2); }
                             else if (bc == 16) { uint32_t v = c.rd(row + 2 * sx, 2); rr = ((v >> 10) & 31) << 3; gg = ((v >> 5) & 31) << 3; bb = (v & 31) << 3; }
@@ -489,11 +540,12 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "waveOutUnprepareHeader") { c.wr32(a(1) + 16, c.rd32(a(1) + 16) & ~2u); ret = 0; }
             else if (nm == "waveOutWrite") { uint32_t hwo = a(0), hdr = a(1), data = c.rd32(hdr), len = c.rd32(hdr + 4); ret = 0; auto wi = waves.find(hwo);
                 if (wi != waves.end() && len && data && (uint64_t)data + len <= c.mem.size()) { WaveOut& w = wi->second; std::vector<int16_t> dec; bool ima = w.tag == 0x11;
-                    if (ima) { dec = ima_adpcm_decode(&c.mem[data], len, w.ch, (int)w.align); }
+                    if (ima) { dec = pm3::ima_adpcm_decode(&c.mem[data], len, w.ch, (int)w.align); }
                     uint32_t pcm_bytes = ima ? (uint32_t)(dec.size() * 2) : len, bps = (uint32_t)w.rate * w.ch * (ima ? 2 : w.bits / 8), dur = bps ? (uint32_t)((uint64_t)pcm_bytes * 1000 / bps) : 0;
                     uint32_t now = host_now(c), start = (!wpend.empty() && (int32_t)(wpend.back().done_ms - now) > 0) ? wpend.back().done_ms : now;
                     c.wr32(hdr + 16, (c.rd32(hdr + 16) & ~1u) | 0x10u); wpend.push_back({hdr, start + dur, hwo});
-                    if (hooks && hooks->on_pcm) { if (ima) hooks->on_pcm((const uint8_t*)dec.data(), pcm_bytes, w.ch, w.rate, 16); else hooks->on_pcm(&c.mem[data], len, w.ch, w.rate, w.bits); }
+                    if (hooks && hooks->on_pcm_ex) { if (ima) hooks->on_pcm_ex((const uint8_t*)dec.data(), pcm_bytes, w.ch, w.rate, 16, true); else hooks->on_pcm_ex(&c.mem[data], len, w.ch, w.rate, w.bits, false); }
+                    else if (hooks && hooks->on_pcm) { if (ima) hooks->on_pcm((const uint8_t*)dec.data(), pcm_bytes, w.ch, w.rate, 16); else hooks->on_pcm(&c.mem[data], len, w.ch, w.rate, w.bits); }
                     char b[80]; snprintf(b, sizeof b, "%u bytes = %u ms", len, dur); note = b; }
                 else if (wi != waves.end()) c.wr32(hdr + 16, c.rd32(hdr + 16) | 1u); }
             else if (nm == "waveOutReset") { while (!wpend.empty()) { WavePend p = wpend.front(); wpend.pop_front(); wave_done(c, p); } ret = 0; }
@@ -570,6 +622,23 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (hooks && hooks->midi && nm == "?MIDI_Play@@YAIPAXHJ@Z") { hooks->midi->play(a(2) != 0); ret = 0; }
             else if (hooks && hooks->midi && nm == "?MIDI_Stop@@YAIPAX@Z") { hooks->midi->stop(); ret = 0; }
             else if (hooks && hooks->midi && nm == "?MIDI_GetIsPlay@@YAHPAX@Z") ret = hooks->midi->playing() ? 1 : 0;
+            else if (hooks && hooks->on_frame && nm == "MoveWindow" && a(0) == MOV_HWND) { mov_rx = (int)a(1); mov_ry = (int)a(2); mov_rw = (int)a(3); mov_rh = (int)a(4); ret = 1; }
+            else if (hooks && hooks->on_frame && nm == "mciSendCommandA" && (a(1) == 0x803 || mov)) {
+                uint32_t cmd = a(1), fl = a(2), pm = a(3); ret = 0;
+                if (cmd == 0x803) {   // MCI_OPEN: with an element name = the movie; a bare device-type open is the game's capability probe
+                    if (fl & 0x200) { std::string path = cstr(c, c.rd32(pm + 12), 260); std::unique_ptr<pm3::AviMovie> m(new pm3::AviMovie); FILE* f = vfs.exists(path) ? vfs.open(path, "rb") : nullptr;
+                        if (f && m->open(f)) { mov = std::move(m); mov_playing = mov_visible = false; mov_rw = mov_rh = 0; mov_paused_el = 0; mov_apos = 0; c.wr32(pm + 4, MOV_DEV); note = path; }
+                        else { ret = 275; note = path + " [failed]"; } } }
+                else if (!mov) {}
+                else if (cmd == 0x804) { mov_stop(c, true); mov.reset(); mov_visible = false; }                                     // MCI_CLOSE
+                else if (cmd == 0x814) { c.wr32(pm + 4, c.rd32(pm + 8) == 0x4001 ? MOV_HWND : 0); }                                // MCI_STATUS (MCI_DGV_STATUS_HWND)
+                else if (cmd == 0x843) { c.wr32(pm + 4, 0); c.wr32(pm + 8, 0); c.wr32(pm + 12, (uint32_t)mov->width()); c.wr32(pm + 16, (uint32_t)mov->height()); }   // MCI_WHERE source rect
+                else if (cmd == 0x806) { mov_stop(c, true); mov->rewind(); mov_apos = 0; mov_t0 = host_now(c); mov_paused_el = 0; mov_cb = (fl & 1) ? c.rd32(pm) : 0; mov_playing = true; mov_visible = false; hostlog("[movie] play\n"); }   // MCI_PLAY
+                else if (cmd == 0x808) { mov_paused_el = mov_elapsed(c); mov_stop(c, true); }                                       // MCI_STOP
+                else if (cmd == 0x809) { if (mov_playing) { mov_paused_el = mov_elapsed(c); mov_playing = false; } }              // MCI_PAUSE
+                else if (cmd == 0x855) { if (!mov_playing) { mov_t0 = host_now(c) - mov_paused_el; mov_playing = true; } }          // MCI_RESUME
+                else if (cmd == 0x807) { mov_stop(c, true); mov->rewind(); mov_apos = 0; mov_paused_el = 0; }                      // MCI_SEEK (to start / end)
+            }
             else if (nm == "DirectDrawCreate") { if (!ddobj) ddobj = make_com(DDN, DDA, 24, false); c.wr32(a(1), ddobj); note = "HLE"; }
             else if (nm == "DirectSoundCreate") { if (!dsobj) dsobj = make_ds(); c.wr32(a(1), dsobj); note = "HLE"; }
             if (getenv("TRACE_API") && (nm == "mciSendCommandA" || nm == "mciGetDeviceIDA" || (nm == "PeekMessageA" && seen[nm] <= 2) || (nm == "timeGetTime" && seen[nm] <= 2) || nm == "?MIDI_FileOpen@@YAIPAXPAD@Z" || nm == "?MIDI_Play@@YAIPAXHJ@Z" || nm == "waveOutWrite" || nm == "waveOutOpen"))
@@ -587,8 +656,8 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     if (getenv("BP")) {   // BP=0xADDR: run to that address once, dump state, then continue
         uint32_t bp = (uint32_t)strtoul(getenv("BP"), 0, 16); ok = cpu.run(bp, maxs);
         hostlog("[BP %08x] eip=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x ZF=%d\n", bp, cpu.eip, cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.ZF);
-        hostlog("  [ebp+0]=%08x [ebp+4]=%08x\n", cpu.rd32(cpu.r[5]), cpu.rd32(cpu.r[5] + 4));
-        for (int k = 0; k < 12; k++) hostlog("  [ebp-%02x] = %08x\n", 4 * (k + 1), cpu.rd32(cpu.r[5] - 4 * (k + 1)));
+        if (cpu.r[5] > 0x1000) hostlog("  [ebp+0]=%08x [ebp+4]=%08x\n", cpu.rd32(cpu.r[5]), cpu.rd32(cpu.r[5] + 4));
+        for (int k = 0; k < 12 && cpu.r[5] > 0x1000; k++) hostlog("  [ebp-%02x] = %08x\n", 4 * (k + 1), cpu.rd32(cpu.r[5] - 4 * (k + 1)));
         if (ok && getenv("WATCH")) {   // single-step until the 32-bit word at WATCH changes
             uint32_t wa = (uint32_t)strtoul(getenv("WATCH"), 0, 16), w0 = cpu.rd32(wa), prev = cpu.eip; uint64_t n = 0; bool hit = false;
             while (n++ < 50000000ull) { prev = cpu.eip; bool r = cpu.run(X86::RET_STOP, 1); if (cpu.rd32(wa) != w0) { hit = true; break; } if (r) break; if (cpu.err != "step limit") { hostlog("[WATCH] stopped: %s\n", cpu.err.c_str()); break; } }
@@ -613,7 +682,9 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             if (!ok && cpu.err == "step limit") { ok = true; cpu.err.clear(); } else if (!ok || stop) break;
             run_threads(cpu, slice * 2);   // loader threads get their share between the main thread's slices
             if (stop) break;
-            for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp;
+            mov_service(cpu);
+            if (getenv("PM3_STATE")) { static uint32_t last = 0xFFFFFFFF; uint32_t st = cpu.rd32(0x49FC98); static uint32_t lm = 0xFFFFFFFF, ls = 0xFFFFFFFF; uint32_t md = cpu.rd32(0x4a1bcc), sg = cpu.rd32(0x490790); if (st != last) { fprintf(stderr, "[state] %u -> %u at step %llu\n", last, st, (unsigned long long)cpu.steps); last = st; } if (md != lm || sg != ls) { fprintf(stderr, "[mode] %d stage %d at step %llu\n", (int)md, (int)sg, (unsigned long long)cpu.steps); lm = md; ls = sg; } }
+            for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; mov_compose(fr);
                 fr.idle = idle_polls - polls0 > 1000; fr.steps = cpu.steps; if (!hooks->on_frame(fr)) { ok = true; maxs = 1; done = 1; } break; }
             if (maxs == 1 && done == 1) break;
         }

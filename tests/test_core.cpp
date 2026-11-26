@@ -126,6 +126,31 @@ int main() {
       CHECK(t.poll(&e) && e.type == pm3::MouseEvent::Move && e.x == 320); CHECK(t.poll(&e) && e.type == pm3::MouseEvent::ButtonDown); CHECK(t.poll(&e) && e.type == pm3::MouseEvent::ButtonUp && e.x == 320 && e.y == 240);
       CHECK(!t.poll(&e) && !t.tracking());
       t.touch_begin(3, 195, 422); t.poll(&e); t.touch_cancel(3); t.touch_end(3, 195, 422); CHECK(!t.poll(&e)); }   // cancel -> no click
+    // ---- volume groups (voice / BGM / SFX): separate queues, gains on top of the tuned defaults, clamping, previews ----
+    { Pm3Bridge* b = pm3_bridge_create();
+      auto pull_peak = [&](int frames, int* held) { std::vector<int16_t> o((size_t)frames * 2, 0x55); int n = pm3_bridge_pull_audio(b, o.data(), frames); if (held) *held = n; int pk = 0; for (int16_t v : o) pk = std::max(pk, (int)std::abs((int)v)); return pk; };
+      std::vector<int16_t> tone(4410); for (int i = 0; i < 4410; i++) tone[(size_t)i] = (int16_t)(10000.0 * std::sin(6.2831853 * 1000.0 * i / 44100.0));
+      auto push = [&](int ch) { pm3_bridge_audio_push(b, ch, (const uint8_t*)tone.data(), 4410 * 2, 1, 44100, 16); };
+      CHECK(pm3_bridge_get_volume(b, PM3_VOL_VOICE) == 1.0f && pm3_bridge_get_volume(b, PM3_VOL_BGM) == 1.0f && pm3_bridge_get_volume(b, PM3_VOL_SFX) == 1.0f);   // defaults = the old fixed loudness
+      int held = 0; push(PM3_VOL_SFX); int pk = pull_peak(4410, &held); CHECK(held == 4410 && pk > 5700 && pk < 6100);               // 10000 * 0.6 default gain
+      pm3_bridge_set_volume(b, PM3_VOL_SFX, 0.5f); push(PM3_VOL_SFX); pk = pull_peak(4410, nullptr); CHECK(pk > 2850 && pk < 3050);
+      pm3_bridge_set_volume(b, PM3_VOL_SFX, 0.0f); push(PM3_VOL_SFX); pk = pull_peak(4410, nullptr); CHECK(pk == 0);               // muted
+      pm3_bridge_set_volume(b, PM3_VOL_VOICE, 1.0f); push(PM3_VOL_SFX); push(PM3_VOL_VOICE); pk = pull_peak(4410, nullptr); CHECK(pk > 5700 && pk < 6100);   // only the voice is audible
+      pm3_bridge_set_volume(b, PM3_VOL_VOICE, 0.0f); pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); push(PM3_VOL_SFX); push(PM3_VOL_VOICE); pk = pull_peak(4410, nullptr); CHECK(pk > 5700 && pk < 6100);   // only the effect
+      pm3_bridge_set_volume(b, PM3_VOL_VOICE, 2.0f); pm3_bridge_set_volume(b, PM3_VOL_SFX, 0.0f); push(PM3_VOL_VOICE); pk = pull_peak(4410, nullptr); CHECK(pk > 11500 && pk < 12100);   // 2x
+      pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); push(PM3_VOL_SFX); push(PM3_VOL_VOICE); pk = pull_peak(4410, nullptr); CHECK(pk <= 18200 && pk > 12000);   // summed, no wrap
+      pm3_bridge_set_volume(b, PM3_VOL_BGM, 5.0f); CHECK(pm3_bridge_get_volume(b, PM3_VOL_BGM) == 2.0f);                                // clamped
+      pm3_bridge_set_volume(b, PM3_VOL_BGM, -1.0f); CHECK(pm3_bridge_get_volume(b, PM3_VOL_BGM) == 0.0f);
+      pm3_bridge_set_volume(b, PM3_VOL_BGM, 0.0f / 0.0f); CHECK(pm3_bridge_get_volume(b, PM3_VOL_BGM) == 0.0f);                         // NaN -> 0
+      pm3_bridge_set_volume(b, 9, 1.0f); CHECK(pm3_bridge_get_volume(b, 9) == 0.0f);                                                    // unknown group ignored
+      // previews: audible at the set level, silent when muted
+      pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_SFX); pk = pull_peak(22050, nullptr); CHECK(pk > 3000);
+      pm3_bridge_set_volume(b, PM3_VOL_VOICE, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_VOICE); pk = pull_peak(22050, nullptr); CHECK(pk > 3000);
+      pm3_bridge_set_volume(b, PM3_VOL_SFX, 0.0f); pm3_bridge_audio_preview(b, PM3_VOL_SFX); pk = pull_peak(22050, nullptr); CHECK(pk == 0);
+      pm3_bridge_set_volume(b, PM3_VOL_BGM, 1.0f); pm3_bridge_audio_preview(b, PM3_VOL_BGM); pk = pull_peak(44100, nullptr); CHECK(pk > 300);   // synth plays the arpeggio
+      pm3_bridge_audio_preview(b, PM3_VOL_BGM); pm3_bridge_set_volume(b, PM3_VOL_BGM, 0.0f); pk = pull_peak(44100, nullptr); CHECK(pk == 0);   // BGM muted
+      pm3_bridge_audio_push(b, PM3_VOL_BGM, (const uint8_t*)tone.data(), 100, 1, 44100, 16); pm3_bridge_set_volume(b, PM3_VOL_SFX, 1.0f); CHECK(pull_peak(1000, nullptr) == 0);   // BGM cannot be pushed as PCM
+      pm3_bridge_destroy(b); }
     // ---- bridge C API: frame buffer upload, viewport, input, files ----
     { Pm3Bridge* b = pm3_bridge_create(); char tmpl[] = "/tmp/pm3brXXXXXX"; std::string base = mkdtemp(tmpl); mkdir((base + "/g").c_str(), 0777);
       { FILE* f = fopen((base + "/g/ID_PM3JP.DAT").c_str(), "wb"); fputs("x", f); fclose(f); }
