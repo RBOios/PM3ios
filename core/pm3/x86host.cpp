@@ -328,7 +328,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     struct MEv { int t, x, y; }; std::deque<MEv> mpend; uint32_t mlast = 0;   // shell mouse events waiting to be delivered, time of the last delivery
     int mouse_x = 320, mouse_y = 240; uint64_t idle_polls = 0;
     if (hooks && hooks->on_frame) pump = [&]() -> bool {
-        for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; fr.idle = false; fr.steps = cpu.steps; return hooks->on_frame(fr); }
+        for (auto rit = surfs.rbegin(); rit != surfs.rend(); ++rit) if (rit->second.primary) { auto& kv = *rit;   /* newest primary: the game re-creates DirectDraw after the movie, the old one stays in the map */ const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; fr.idle = false; fr.steps = cpu.steps; return hooks->on_frame(fr); }
         return true; };   // last cursor position given to the guest; PeekMessage polls with an empty queue in this slice
 
     // ---- GDI palettes: CreatePalette/SelectPalette bookkeeping (the logo / DIB_PAL_COLORS bitmaps index into the DC's selected palette) ----
@@ -627,7 +627,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
                 uint32_t cmd = a(1), fl = a(2), pm = a(3); ret = 0;
                 if (cmd == 0x803) {   // MCI_OPEN: with an element name = the movie; a bare device-type open is the game's capability probe
                     if (fl & 0x200) { std::string path = cstr(c, c.rd32(pm + 12), 260); std::unique_ptr<pm3::AviMovie> m(new pm3::AviMovie); FILE* f = vfs.exists(path) ? vfs.open(path, "rb") : nullptr;
-                        if (f && m->open(f)) { mov = std::move(m); mov_playing = mov_visible = false; mov_rw = mov_rh = 0; mov_paused_el = 0; mov_apos = 0; c.wr32(pm + 4, MOV_DEV); note = path; }
+                        if (f && !getenv("PM3_NOMOVIE") && m->open(f)) { mov = std::move(m); mov_playing = mov_visible = false; mov_rw = mov_rh = 0; mov_paused_el = 0; mov_apos = 0; c.wr32(pm + 4, MOV_DEV); note = path; }
                         else { ret = 275; note = path + " [failed]"; } } }
                 else if (!mov) {}
                 else if (cmd == 0x804) { mov_stop(c, true); mov.reset(); mov_visible = false; }                                     // MCI_CLOSE
@@ -643,6 +643,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             else if (nm == "DirectSoundCreate") { if (!dsobj) dsobj = make_ds(); c.wr32(a(1), dsobj); note = "HLE"; }
             if (getenv("TRACE_API") && (nm == "mciSendCommandA" || nm == "mciGetDeviceIDA" || (nm == "PeekMessageA" && seen[nm] <= 2) || (nm == "timeGetTime" && seen[nm] <= 2) || nm == "?MIDI_FileOpen@@YAIPAXPAD@Z" || nm == "?MIDI_Play@@YAIPAXHJ@Z" || nm == "waveOutWrite" || nm == "waveOutOpen"))
                 hostlog("  [trace] %s ret@%x args %x %x %x %x\n", nm.c_str(), c.rd32(c.r[4]), a(0), a(1), a(2), a(3));
+            if (getenv("PM3_RETHIST")) { static std::map<std::string, uint64_t> rh; if (++rh[nm + "@" + std::to_string(c.rd32(c.r[4]))] == 2000000) { for (auto& kv : rh) if (kv.second > 1000) hostlog("[rethist] %s %llu\n", kv.first.c_str(), (unsigned long long)kv.second); } }
             ring.push_back(nm); if (ring.size() > 12) ring.erase(ring.begin());
             if ((calls < 4000 && seen[nm] <= 12) || stop) hostlog("%s%s(%s) -> %u\n", nm.c_str(), note.empty() ? "" : "", note.c_str(), ret);
             calls++;
@@ -684,7 +685,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             if (stop) break;
             mov_service(cpu);
             if (getenv("PM3_STATE")) { static uint32_t last = 0xFFFFFFFF; uint32_t st = cpu.rd32(0x49FC98); static uint32_t lm = 0xFFFFFFFF, ls = 0xFFFFFFFF; uint32_t md = cpu.rd32(0x4a1bcc), sg = cpu.rd32(0x490790); if (st != last) { fprintf(stderr, "[state] %u -> %u at step %llu\n", last, st, (unsigned long long)cpu.steps); last = st; } if (md != lm || sg != ls) { fprintf(stderr, "[mode] %d stage %d at step %llu\n", (int)md, (int)sg, (unsigned long long)cpu.steps); lm = md; ls = sg; } }
-            for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; mov_compose(fr);
+            for (auto rit = surfs.rbegin(); rit != surfs.rend(); ++rit) if (rit->second.primary) { auto& kv = *rit;   /* newest primary: the game re-creates DirectDraw after the movie, the old one stays in the map */ const Surf& sf = kv.second; X86Frame fr; fr.pixels = &cpu.mem[sf.mem]; fr.width = sf.w; fr.height = sf.h; fr.pitch = sf.pitch; fr.bpp = sf.bpp; mov_compose(fr);
                 fr.idle = idle_polls - polls0 > 1000; fr.steps = cpu.steps; if (!hooks->on_frame(fr)) { ok = true; maxs = 1; done = 1; } break; }
             if (maxs == 1 && done == 1) break;
         }
@@ -692,6 +693,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
     if (!ok) { hostlog("regs: eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7]);
         hostlog("stack:"); for (int k = 0; k < 16 && cpu.r[4] > 0x1000; k++) hostlog(" %08x", cpu.rd32(cpu.r[4] + 4 * k)); hostlog("\n"); }
     hostlog("--- %s after %llu steps, %d API calls (eip %08x)  %s\n", ok ? "stopped" : "ERROR", (unsigned long long)cpu.steps, calls, cpu.eip, ok ? "" : cpu.err.c_str());
+    if (getenv("PM3_HIST")) { std::vector<std::pair<uint64_t,std::string>> v; for (auto& kv : seen) v.push_back({(uint64_t)kv.second, kv.first}); std::sort(v.rbegin(), v.rend()); for (size_t i = 0; i < v.size() && i < 25; i++) hostlog("  [hist] %s %llu\n", v[i].second.c_str(), (unsigned long long)v[i].first); }
     if (!ring.empty()) { hostlog("last host calls:"); for (auto& n : ring) hostlog(" %s", n.c_str()); hostlog("\n"); }
     if (getenv("STATS")) { std::vector<std::pair<int, std::string>> v; for (auto& kv : seen) v.push_back({kv.second, kv.first}); std::sort(v.rbegin(), v.rend());
         hostlog("COM call counts:"); for (auto& kv : ddseen) hostlog(" %s=%d", kv.first.c_str(), kv.second); hostlog("\n");
@@ -707,7 +709,7 @@ int x86host_main(int argc, char** argv, const X86Hooks* hooks) {
             fclose(f); hostlog("surface %d @%x: %dx%d %dbpp %s%s -> %s\n", n - 1, (unsigned)sf.obj, sf.w, sf.h, sf.bpp, sf.primary ? "PRIMARY " : "", any ? "has pixels" : "all zero", fn.c_str()); }
     }
     if (const char* po = getenv("DUMP_PRIMARY")) {   // DUMP_PRIMARY=<file.ppm> : write the primary surface (RGB565/XRGB8888) at exit
-        for (auto& kv : surfs) if (kv.second.primary) { const Surf& sf = kv.second; FILE* f = fopen(po, "wb"); if (!f) break;
+        for (auto rit = surfs.rbegin(); rit != surfs.rend(); ++rit) if (rit->second.primary) { auto& kv = *rit;   /* newest primary: the game re-creates DirectDraw after the movie, the old one stays in the map */ const Surf& sf = kv.second; FILE* f = fopen(po, "wb"); if (!f) break;
             fprintf(f, "P6\n%d %d\n255\n", sf.w, sf.h);
             for (int y = 0; y < sf.h; y++) for (int x = 0; x < sf.w; x++) { uint8_t rgb[3];
                 if (sf.bpp == 16) { uint32_t v = cpu.rd(sf.mem + y * sf.pitch + x * 2, 2); rgb[0] = ((v >> 11) & 31) * 255 / 31; rgb[1] = ((v >> 5) & 63) * 255 / 63; rgb[2] = (v & 31) * 255 / 31; }
